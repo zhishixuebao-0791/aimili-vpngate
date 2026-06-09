@@ -71,14 +71,14 @@ def _choose_key(keys: list[str]) -> str | None:
     return random.choice(keys) if keys else None
 
 
-PURITY_SCORE_THRESHOLD = _env_int("PURITY_SCORE_THRESHOLD", 20, 0, 100)
-PURITY_MIN_PASS_RATIO = _env_int("PURITY_MIN_PASS_RATIO", 60, 0, 100)
+PURITY_SCORE_THRESHOLD = _env_int("PURITY_SCORE_THRESHOLD", 60, 0, 100)
+PURITY_MIN_PASS_RATIO = _env_int("PURITY_MIN_PASS_RATIO", 99, 0, 100)
 PURITY_CACHE_TTL_SECONDS = _env_int("PURITY_CACHE_TTL_SECONDS", 7 * 24 * 3600, 60)
 PURITY_ENABLE_PROXYCHECK = os.environ.get("PURITY_ENABLE_PROXYCHECK", "").strip().lower() in ("1", "true", "yes", "on")
 PROXYCHECK_API_KEY = os.environ.get("PROXYCHECK_API_KEY", "").strip()
 ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
 API_KEYS_FILE = Path(os.environ.get("API_KEYS_FILE", ROOT_DIR / "API_Port.txt")).resolve()
-PURITY_CACHE_VERSION = 2
+PURITY_CACHE_VERSION = 3
 
 COUNTRY_TRANSLATIONS = {
     "Japan": "日本",
@@ -568,9 +568,9 @@ def _clamp_score(score: int) -> int:
 def _purity_grade(score: int) -> str:
     if score < 20:
         return "clean"
-    if score < 40:
+    if score <= 60:
         return "neutral"
-    if score < 70:
+    if score < 85:
         return "risky"
     return "blocked"
 
@@ -649,36 +649,36 @@ def _query_abuseipdb(ip: str) -> dict[str, Any] | None:
 
 
 def _local_purity_score(node: dict[str, Any]) -> tuple[int, list[str]]:
-    score = 8
+    score = 6
     reasons: list[str] = ["local baseline"]
     ip_type = str(node.get("ip_type") or "").lower()
     quality = str(node.get("quality") or "").lower()
 
     if ip_type == "mobile":
-        score -= 4
+        score -= 3
         reasons.append("mobile ISP")
     elif ip_type == "residential":
         reasons.append("residential/ISP")
     elif ip_type == "hosting":
-        score += 28
+        score += 22
         reasons.append("hosting network")
 
     if quality == "proxy":
-        score += 70
+        score += 38
         reasons.append("ip-api proxy flag")
     elif quality == "datacenter":
-        score += 34
+        score += 26
         reasons.append("datacenter quality")
     elif quality == "mobile":
-        score -= 3
+        score -= 2
         reasons.append("mobile quality")
 
     owner_text = " ".join(
         str(node.get(key) or "")
-        for key in ("owner", "as_name", "asn", "host_name", "remote_host")
+        for key in ("owner", "as_name", "asn", "remote_host")
     )
     hard_keywords = (
-        "vpn", "proxy", "tor", "cloudflare", "akamai", "cdn", "hosting",
+        "tor exit", "cloudflare", "akamai", "cdn", "hosting",
         "host ", "datacenter", "data center", "colo", "server", "vps",
         "digitalocean", "linode", "vultr", "ovh", "hetzner", "contabo",
         "amazon", "aws", "google cloud", "microsoft", "azure", "oracle",
@@ -690,28 +690,28 @@ def _local_purity_score(node: dict[str, Any]) -> tuple[int, list[str]]:
     )
     hit = _contains_any(owner_text, hard_keywords)
     if hit:
-        score += 22
+        score += 18
         reasons.append(f"suspicious operator keyword: {hit}")
     else:
         hit = _contains_any(owner_text, medium_keywords)
         if hit:
-            score += 8
+            score += 4
             reasons.append(f"operator keyword: {hit}")
 
     sessions = _safe_int(node.get("sessions"), 0)
-    if sessions >= 100:
-        score += 20
+    if sessions >= 300:
+        score += 6
         reasons.append("high VPNGate session sharing")
-    elif sessions >= 50:
-        score += 10
+    elif sessions >= 100:
+        score += 3
         reasons.append("medium VPNGate session sharing")
 
     latency = _safe_int(node.get("latency_ms"), 0)
     if latency >= 1000:
-        score += 8
+        score += 6
         reasons.append("very high latency")
     elif latency >= 500:
-        score += 4
+        score += 2
         reasons.append("high latency")
 
     return _clamp_score(score), reasons
@@ -755,14 +755,27 @@ def assess_ip_purity(node: dict[str, Any]) -> dict[str, Any]:
             if isinstance(detections, dict):
                 confidence = _safe_int(detections.get("confidence"), 0)
                 if confidence:
-                    score = max(score, min(100, confidence))
+                    if confidence >= 95:
+                        score = max(score, 70)
+                    elif confidence >= 85:
+                        score = max(score, 55)
+                    elif confidence >= 70:
+                        score = max(score, 42)
+                    elif confidence >= 50:
+                        score = max(score, 30)
                     reasons.append(f"proxycheck confidence {confidence}")
                 for key in ("anonymous", "proxy", "vpn", "tor", "hosting", "scraper"):
                     if detections.get(key) is True:
-                        score = max(score, 70 if key in ("proxy", "vpn", "tor", "anonymous") else 45)
                         reasons.append(f"proxycheck {key}")
-                        if key in ("anonymous", "proxy", "vpn", "tor"):
+                        if key in ("anonymous", "tor"):
+                            score = max(score, 90)
                             hard_block = True
+                        elif key in ("proxy", "vpn"):
+                            score = max(score, 52 if confidence < 95 else 68)
+                        elif key == "hosting":
+                            score = max(score, 38 if confidence < 95 else 55)
+                        elif key == "scraper":
+                            score = max(score, 45)
 
     abuse = _query_abuseipdb(str(ip))
     if abuse is not None:
@@ -772,9 +785,18 @@ def assess_ip_purity(node: dict[str, Any]) -> dict[str, Any]:
         else:
             abuse_score = _safe_int(abuse.get("abuseConfidenceScore"), 0)
             if abuse_score:
-                score = max(score, abuse_score)
+                if abuse_score >= 90:
+                    score = max(score, 92)
+                elif abuse_score >= 75:
+                    score = max(score, 82)
+                elif abuse_score >= 50:
+                    score = max(score, 65)
+                elif abuse_score >= 25:
+                    score = max(score, 42)
+                else:
+                    score = max(score, abuse_score)
                 reasons.append(f"abuseipdb score {abuse_score}")
-                if abuse_score >= 50:
+                if abuse_score >= 90:
                     hard_block = True
 
     score = _clamp_score(score)
@@ -806,7 +828,7 @@ def assess_nodes_purity(nodes: list[dict[str, Any]], threshold: int | None = Non
         min_pass_count = (len(scored_nodes) * PURITY_MIN_PASS_RATIO + 99) // 100
         current_pass_count = len([
             node for node in scored_nodes
-            if _safe_int(node.get("purity_score"), 100) < effective_threshold
+            if _safe_int(node.get("purity_score"), 100) <= effective_threshold
         ])
         if current_pass_count < min_pass_count:
             calibratable = [
@@ -820,8 +842,8 @@ def assess_nodes_purity(nodes: list[dict[str, Any]], threshold: int | None = Non
             for node in calibratable:
                 if current_pass_count >= min_pass_count:
                     break
-                if _safe_int(node.get("purity_score"), 100) >= effective_threshold:
-                    node["purity_score"] = max(0, effective_threshold - 1)
+                if _safe_int(node.get("purity_score"), 100) > effective_threshold:
+                    node["purity_score"] = effective_threshold
                     node["purity_grade"] = _purity_grade(_safe_int(node.get("purity_score"), 0))
                     reasons = node.get("purity_reasons")
                     if not isinstance(reasons, list):
@@ -831,10 +853,10 @@ def assess_nodes_purity(nodes: list[dict[str, Any]], threshold: int | None = Non
                     current_pass_count += 1
 
     for node in scored_nodes:
-        if _safe_int(node.get("purity_score"), 100) >= effective_threshold:
+        if _safe_int(node.get("purity_score"), 100) > effective_threshold:
             node["probe_status"] = "unavailable"
             reason_text = "; ".join(str(item) for item in node.get("purity_reasons", [])[:4])
-            node["probe_message"] = f"Purity score {node['purity_score']} >= {effective_threshold}; {reason_text}"
+            node["probe_message"] = f"Purity score {node['purity_score']} > {effective_threshold}; {reason_text}"
 
 
 def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -> tuple[int, str]:

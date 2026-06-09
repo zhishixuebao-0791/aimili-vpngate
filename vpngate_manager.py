@@ -994,7 +994,7 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", keep_process: bool | None = None) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
@@ -1084,7 +1084,8 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
         message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
     startup_done[0] = True
-    if not keep_alive or not ok:
+    should_keep_process = keep_alive if keep_process is None else keep_process
+    if not should_keep_process or not ok:
         stop_process(process)
         process = None
     return ok, message, process
@@ -1189,63 +1190,269 @@ def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
 
-def test_node_by_id(node_id: str) -> dict[str, Any]:
-    with lock:
-        nodes = read_nodes()
-        node = next((item for item in nodes if item.get("id") == node_id), None)
-        if not node:
-            raise ValueError(f"Node not found: {node_id}")
-        h = str(node.get("remote_host") or node.get("ip"))
-        p = parse_int(node.get("remote_port"))
-        fallback_ping = parse_int(node.get("ping"))
+def resolve_probe_ipv4(host: str) -> str:
+    if not host:
+        return ""
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, 80, socket.AF_INET, socket.SOCK_STREAM)
+        for info in infos:
+            ip = info[4][0]
+            if ip:
+                return ip
+    except Exception:
+        pass
+    return ""
 
-    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-    ok = latency > 0 and latency <= 1000
-    if latency <= 0:
-        message = "Latency probe timeout"
-    elif latency > 1000:
-        message = f"Latency {latency} ms > 1000 ms"
-    else:
-        message = f"Latency probe ok: {latency} ms"
+def add_temporary_probe_route(ip: str, dev: str) -> bool:
+    if not sys.platform.startswith("linux") or not ip or not dev:
+        return False
+    try:
+        res = subprocess.run(
+            ["ip", "route", "add", f"{ip}/32", "dev", dev],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
 
-    temp_node = {
+def delete_temporary_probe_route(ip: str, dev: str) -> None:
+    if not sys.platform.startswith("linux") or not ip or not dev:
+        return
+    try:
+        subprocess.run(
+            ["ip", "route", "del", f"{ip}/32", "dev", dev],
+            capture_output=True,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+def build_interface_probe_request(url: str) -> tuple[str, str, str]:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    route_ip = resolve_probe_ipv4(host)
+    if not route_ip or route_ip == host:
+        return url, route_ip, ""
+    netloc = route_ip
+    if parsed.port:
+        netloc = f"{route_ip}:{parsed.port}"
+    probe_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+    return probe_url, route_ip, host
+
+def measure_interface_egress_latency(dev: str, timeout: int = 8) -> dict[str, Any]:
+    targets = [
+        ("http://cp.cloudflare.com/generate_204", False),
+        ("http://api.ipify.org", True),
+        ("http://ip.sb", True),
+        ("http://1.1.1.1/cdn-cgi/trace", False),
+    ]
+    best: dict[str, Any] | None = None
+    last_error = ""
+    for url, body_is_ip in targets:
+        probe_url, route_ip, host_header = build_interface_probe_request(url)
+        route_added = add_temporary_probe_route(route_ip, dev)
+        cmd = [
+            "curl",
+            "-4",
+            "-sS",
+            "--interface",
+            dev,
+            "-o",
+            "-",
+            "-w",
+            "\n%{time_total} %{http_code}",
+            "--max-time",
+            str(timeout),
+        ]
+        if host_header:
+            cmd.extend(["-H", f"Host: {host_header}"])
+        cmd.append(probe_url)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+            if res.returncode != 0:
+                last_error = (res.stderr or res.stdout or "").strip()[-180:]
+                continue
+            lines = res.stdout.strip().splitlines()
+            if not lines:
+                last_error = "empty curl response"
+                continue
+            time_info = lines[-1].strip().split()
+            if len(time_info) != 2:
+                last_error = f"bad curl timing: {lines[-1][-120:]}"
+                continue
+            total_time_str, http_code = time_info
+            if http_code not in ("200", "204"):
+                last_error = f"http {http_code}"
+                continue
+            latency_ms = int(float(total_time_str) * 1000)
+            ip = ""
+            body = "\n".join(lines[:-1]).strip()
+            if body_is_ip and re.match(r"^[0-9a-fA-F:.]+$", body):
+                ip = body
+            elif "ip=" in body:
+                for part in body.splitlines():
+                    if part.startswith("ip="):
+                        ip = part.removeprefix("ip=").strip()
+                        break
+            result = {"ok": True, "latency_ms": latency_ms, "ip": ip, "via": dev, "url": url}
+            if best is None or latency_ms < parse_int(best.get("latency_ms")):
+                best = result
+        except Exception as exc:
+            last_error = str(exc)
+        finally:
+            if route_added:
+                delete_temporary_probe_route(route_ip, dev)
+    if best:
+        return best
+    return {"ok": False, "latency_ms": 0, "error": last_error or f"egress latency probe failed via {dev}", "via": dev}
+
+def active_node_real_latency(node_id: str) -> dict[str, Any] | None:
+    if active_openvpn_node_id and node_id == active_openvpn_node_id and active_openvpn_running():
+        return check_proxy_health()
+    return None
+
+def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
+    node_id = str(node_info.get("id") or "")
+    active_result = active_node_real_latency(node_id)
+    if active_result is not None:
+        latency = parse_int(active_result.get("latency_ms"))
+        ok = bool(active_result.get("ok")) and latency > 0 and latency <= 1000
+        message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > 1000 ms")
+        return {
+            "id": node_id,
+            "ip": node_info.get("ip") or node_info.get("remote_host") or "",
+            "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
+            "remote_port": parse_int(node_info.get("remote_port")),
+            "host_name": node_info.get("host_name", ""),
+            "sessions": node_info.get("sessions", 0),
+            "latency_ms": latency,
+            "probe_status": "available" if ok else "unavailable",
+            "probe_message": message,
+            "probed_at": time.time(),
+            "owner": node_info.get("owner", ""),
+            "asn": node_info.get("asn", ""),
+            "as_name": node_info.get("as_name", ""),
+            "location": node_info.get("location", ""),
+            "ip_type": node_info.get("ip_type", ""),
+            "quality": node_info.get("quality", ""),
+            "egress_ip": active_result.get("ip", ""),
+        }
+
+    config_text = node_info.get("config_text") or ""
+    if not config_text:
+        return {
+            "id": node_id,
+            "latency_ms": 0,
+            "probe_status": "unavailable",
+            "probe_message": "Missing OpenVPN config",
+            "probed_at": time.time(),
+        }
+
+    temp_path = test_config_path(node_id)
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+    except Exception as e:
+        return {
+            "id": node_id,
+            "latency_ms": 0,
+            "probe_status": "unavailable",
+            "probe_message": f"Failed to write configuration: {e}",
+            "probed_at": time.time(),
+        }
+
+    tun_idx = None
+    process = None
+    ok = False
+    message = ""
+    latency = 0
+    egress_ip = ""
+    try:
+        tun_idx = get_free_test_index()
+        dev_name = f"tun{tun_idx}"
+        ok, message, process = run_openvpn_until_ready(
+            str(temp_path),
+            keep_alive=False,
+            route_nopull=True,
+            timeout=12,
+            dev=dev_name,
+            keep_process=True,
+        )
+        if ok and process is not None:
+            probe = measure_interface_egress_latency(dev_name)
+            latency = parse_int(probe.get("latency_ms"))
+            egress_ip = str(probe.get("ip") or "")
+            ok = bool(probe.get("ok")) and latency > 0 and latency <= 1000
+            if not probe.get("ok"):
+                message = str(probe.get("error") or "egress latency probe failed")
+            elif latency > 1000:
+                message = f"Real egress latency {latency} ms > 1000 ms"
+            else:
+                message = f"Real egress latency ok: {latency} ms"
+    finally:
+        stop_process(process)
+        if tun_idx is not None:
+            release_test_index(tun_idx)
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+    result = {
         "id": node_id,
-        "ip": h,
-        "remote_host": h,
-        "remote_port": p,
+        "ip": node_info.get("ip") or node_info.get("remote_host") or "",
+        "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
+        "remote_port": parse_int(node_info.get("remote_port")),
+        "host_name": node_info.get("host_name", ""),
+        "sessions": node_info.get("sessions", 0),
+        "latency_ms": latency,
+        "probe_status": "available" if ok else "unavailable",
+        "probe_message": message,
+        "probed_at": time.time(),
         "owner": "",
         "asn": "",
         "as_name": "",
         "location": "",
         "ip_type": "",
         "quality": "",
-        "purity_score": 100,
-        "purity_raw_score": 100,
-        "purity_grade": "not_checked",
-        "purity_reasons": [],
-        "purity_sources": [],
-        "purity_checked_at": 0,
-        "purity_hard_block": False,
+        "egress_ip": egress_ip,
+        "purity_score": node_info.get("purity_score", 100),
+        "purity_raw_score": node_info.get("purity_raw_score", 100),
+        "purity_grade": node_info.get("purity_grade", "not_checked"),
+        "purity_reasons": node_info.get("purity_reasons", []),
+        "purity_sources": node_info.get("purity_sources", []),
+        "purity_checked_at": node_info.get("purity_checked_at", 0),
+        "purity_hard_block": node_info.get("purity_hard_block", False),
     }
     if ok:
-        vpn_utils.enrich_ip_info([temp_node])
+        vpn_utils.enrich_ip_info([result])
+        if purity_check:
+            vpn_utils.assess_nodes_purity([result])
+    return result
+
+def test_node_by_id(node_id: str) -> dict[str, Any]:
+    with lock:
+        nodes = read_nodes()
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            raise ValueError(f"Node not found: {node_id}")
+        node_info = node.copy()
+
+    tested = test_node_real_egress(node_info, purity_check=False)
 
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
-            node["latency_ms"] = latency
-            node["probe_status"] = "available" if ok else "unavailable"
-            node["probe_message"] = message
-            node["probed_at"] = time.time()
-            if ok:
-                node["owner"] = temp_node["owner"]
-                node["asn"] = temp_node["asn"]
-                node["as_name"] = temp_node["as_name"]
-                node["location"] = temp_node["location"]
-                node["ip_type"] = temp_node["ip_type"]
-                node["quality"] = temp_node["quality"]
-            
+            node.update({k: v for k, v in tested.items() if k != "id"})
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -1259,87 +1466,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         to_test = [n for n in nodes if n.get("id") in node_ids]
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-        idx, n_info = args
-        node_id = n_info["id"]
-        config_text = n_info.get("config_text") or ""
-        h = str(n_info.get("remote_host") or n_info.get("ip"))
-        p = parse_int(n_info.get("remote_port"))
-        fallback_ping = parse_int(n_info.get("ping"))
-        
-        temp_path = test_config_path(node_id)
-        try:
-            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
-        except Exception as e:
-            return {
-                "id": node_id,
-                "latency_ms": 0,
-                "probe_status": "unavailable",
-                "probe_message": f"Failed to write configuration: {e}",
-                "probed_at": time.time(),
-                "owner": "",
-                "asn": "",
-                "as_name": "",
-                "location": "",
-                "ip_type": "",
-                "quality": "",
-                "purity_score": 100,
-                "purity_raw_score": 100,
-                "purity_grade": "not_checked",
-                "purity_reasons": [],
-                "purity_sources": [],
-                "purity_checked_at": 0,
-                "purity_hard_block": False,
-            }
-            
-        latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-        tun_idx = None
-        try:
-            tun_idx = get_free_test_index()
-            dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
-        finally:
-            if tun_idx is not None:
-                release_test_index(tun_idx)
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-
-        if latency <= 0:
-            ok = False
-            message = "Latency probe timeout"
-        elif latency > 1000:
-            ok = False
-            message = f"Latency {latency} ms > 1000 ms"
-            
-        temp_node = {
-            "id": node_id,
-            "ip": n_info.get("ip") or h,
-            "remote_host": h,
-            "remote_port": p,
-            "host_name": n_info.get("host_name", ""),
-            "sessions": n_info.get("sessions", 0),
-            "latency_ms": latency,
-            "probe_status": "available" if ok else "unavailable",
-            "probe_message": message,
-            "probed_at": time.time(),
-            "owner": "",
-            "asn": "",
-            "as_name": "",
-            "location": "",
-            "ip_type": "",
-            "quality": "",
-            "purity_score": 100,
-            "purity_raw_score": 100,
-            "purity_grade": "not_checked",
-            "purity_reasons": [],
-            "purity_sources": [],
-            "purity_checked_at": 0,
-            "purity_hard_block": False,
-        }
-        return temp_node
+        _, n_info = args
+        return test_node_real_egress(n_info, purity_check=False)
 
     updated_nodes_map = {}
     max_workers = min(5, max(1, len(to_test)))
@@ -3516,7 +3644,7 @@ function riskDisplay(n) {
   if (!n || !n.purity_checked_at) return { text: "-", cls: "", title: "未进行纯净度评估" };
   const score = parseInt(n.purity_score || 0);
   const rawScore = parseInt(n.purity_raw_score || score || 0);
-  const cls = score < 20 ? "latency-good" : (score < 40 ? "latency-medium" : "latency-poor");
+  const cls = score <= 60 ? "latency-good" : (score < 85 ? "latency-medium" : "latency-poor");
   const reasons = Array.isArray(n.purity_reasons) ? n.purity_reasons.join("; ") : "";
   return {
     text: `${score}%`,

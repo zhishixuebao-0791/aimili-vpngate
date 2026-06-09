@@ -205,9 +205,9 @@
 
 过滤策略：
 
-- 默认保守阈值：`purity_score < 20` 保留。
-- `20 <= purity_score < 40` 标记为中性，默认不自动连接，但可在 UI 中展示。
-- `purity_score >= 40` 剔除或标记不可用。
+- 当前宽松阈值：`purity_score <= 60` 保留。
+- `61 <= purity_score < 85` 标记为中风险，批量校准后通常仍可保留。
+- `purity_score >= 85` 标记为高风险；只有硬剔除命中或批量 99% 通过率之外的极少数节点会被标记不可用。
 
 ### 对当前项目的最佳方案
 
@@ -227,7 +227,7 @@
 1. 先实现本地免费纯净度评分 `purity_score`，不依赖付费 Ping0。
 2. 增加缓存文件 `purity_cache.json`，避免重复查询和重复计算。
 3. 在节点批量测试成功后执行纯净度评分。
-4. 默认过滤 `purity_score >= 20` 的节点，但保留环境变量允许调节阈值。
+4. 默认过滤 `purity_score > 60` 的节点，并通过 `PURITY_MIN_PASS_RATIO=99` 尽量避免错杀纯净节点。
 5. 后续再接入可选 Ping0 API，使有 key 的用户获得更准确的官方风控值。
 
 ## 2026-06-08 补充：开源项目搜索结论与当前实现
@@ -255,7 +255,7 @@
 
 已在 `vpn_utils.py` 增加：
 
-- `PURITY_SCORE_THRESHOLD`，默认 `20`。
+- `PURITY_SCORE_THRESHOLD`，当前默认 `60`，风险值 `<=60%` 通过。
 - `PURITY_CACHE_TTL_SECONDS`，默认 7 天。
 - `PURITY_ENABLE_PROXYCHECK`，默认关闭，设置为 `1/true/yes/on` 后启用无 key proxycheck.io 查询。
 - `PROXYCHECK_API_KEY`，配置后启用 proxycheck.io，免费 key 可提升额度。
@@ -266,16 +266,16 @@
 本地评分已使用：
 
 - 现有 `ip-api.com` 富集后的 `ip_type` 和 `quality`。
-- ASN、运营主体、主机名、远端主机名关键词。
-- VPNGate `sessions` 作为共享程度参考。
+- ASN、运营主体、远端主机名关键词。
+- VPNGate `sessions` 仅作为轻微共享程度参考。
 - 延迟作为弱风险参考。
 
 已在 `vpngate_manager.py` 接入：
 
 - 新节点默认包含 `purity_score`、`purity_grade`、`purity_reasons`、`purity_sources`、`purity_checked_at`。
-- 单节点测试成功后执行纯净度评分。
+- 单节点“检测”只测真实出口延迟，不触发纯净度 API。
 - 批量节点测试成功后执行纯净度评分。
-- `purity_score >= PURITY_SCORE_THRESHOLD` 的节点会被标记为 `unavailable`，不会参与自动连接。
+- `purity_score > PURITY_SCORE_THRESHOLD` 的节点会被标记为 `unavailable`，不会参与自动连接。
 - 可用节点排序时会优先选择更低 `purity_score` 的节点。
 
 ### 验证结果
@@ -285,7 +285,7 @@
 ### 后续建议
 
 1. 在真实 VPS 环境跑一次节点刷新，观察 `vpngate_data/nodes.json` 中的 `purity_score` 和 `probe_message`。
-2. 根据误杀情况调节 `PURITY_SCORE_THRESHOLD`，例如先用 `30` 观察，再收紧到 `20`。
+2. 根据误杀情况调节 `PURITY_SCORE_THRESHOLD`，当前默认 `60`；如果漏过明显高风险节点，再逐步收紧。
 3. 如果免费本地评分误差较大，再开启 `PURITY_ENABLE_PROXYCHECK=1` 或配置 `PROXYCHECK_API_KEY`。
 4. 前端表格可后续单独修复编码问题后展示 `Purity` 列；当前后端 API 已返回评分字段。
 
@@ -326,21 +326,21 @@
 
 - 本地规则先生成 `purity_raw_score`。
 - proxycheck.io `confidence` 和 AbuseIPDB `abuseConfidenceScore` 会提高风险分。
-- 最终输出 `purity_score`，默认阈值为 `20`。
-- `purity_score >= 20` 的节点标记为 `unavailable`，不会参与自动连接。
+- 最终输出 `purity_score`，当前默认阈值为 `60`。
+- `purity_score > 60` 的节点标记为 `unavailable`，不会参与自动连接。
 
-60% 通过率控制：
+99% 通过率控制：
 
-- 新增 `PURITY_MIN_PASS_RATIO`，默认 `60`。
-- 批量测试时，如果通过率低于 60%，会在非硬剔除节点中按原始风险分从低到高进行校准。
-- 被校准放行的节点会保留 `purity_raw_score`，并在 `purity_reasons` 中记录 `batch pass-floor calibration 60%`。
-- 如果硬剔除节点超过 40%，则无法安全保证总通过率达到 60%，因为硬剔除不会被强行放行。
+- 新增 `PURITY_MIN_PASS_RATIO`，当前默认 `99`。
+- 批量测试时，如果通过率低于 99%，会在非硬剔除节点中按原始风险分从低到高进行校准。
+- 被校准放行的节点会保留 `purity_raw_score`，并在 `purity_reasons` 中记录 `batch pass-floor calibration 99%`。
+- 如果硬剔除节点超过 1%，则无法安全保证总通过率达到 99%，因为硬剔除不会被强行放行。
 
 ### 已验证
 
 - 解析到 proxycheck.io key 数：2。
 - 解析到 AbuseIPDB key 数：2。
-- 批量样例 10 个节点中 6 个通过，满足默认 60% 通过率。
+- 当前模拟样例 100 个非硬剔除节点中 99 个通过，满足默认 99% 通过率。
 - 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
 
 ## 2026-06-08 补充：刷新筛选与手动检测路径拆分
@@ -387,3 +387,88 @@
 ### 已验证
 
 - 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
+## 2026-06-09 补充：真实出口延迟测速方案已实现
+
+### 调整目标
+
+- 不新增额外监听端口。
+- 点击“检测”时测当前节点建立 OpenVPN 后的真实出口访问延迟，而不是只测节点入口 TCP 延迟。
+- 点击“更新节点”批量检测时也使用同一套真实出口测速逻辑。
+- 如果被检测节点已经是当前连接节点，直接复用本地代理网关 `127.0.0.1:7928` 做出口检测，避免重复启动 OpenVPN。
+
+### 已实现
+
+- `run_openvpn_until_ready()` 新增 `keep_process` 参数，允许临时测速连接建立成功后短暂保留进程，测速结束再清理。
+- 新增 `measure_interface_egress_latency(dev)`：
+  - 通过 `curl --interface tunX` 从临时 OpenVPN 网卡发起 HTTP 探测。
+  - 为每个测速目标临时添加 `/32` 主机路由到测试网卡，避免 `route-nopull` 下无默认路由导致测速失败。
+  - 测速结束后立即删除临时主机路由，不改变服务器默认出口。
+  - 使用多个轻量目标取最优响应时间。
+  - 返回真实出口延迟、出口 IP、探测目标和错误信息。
+- 新增 `active_node_real_latency(node_id)`：
+  - 如果节点已经通过 7928 本地代理处于连接状态，则直接调用现有 `check_proxy_health()`。
+  - 表格中的检测按钮和批量更新都会复用这个结果。
+- 新增 `test_node_real_egress()` 作为统一测速入口：
+  - 当前活动节点：复用 7928 代理出口检测。
+  - 非活动节点：启动临时 OpenVPN 到独立 `tunX`，通过该接口测速，测速后立刻释放进程和测试网卡编号。
+  - `latency_ms <= 0` 或 `latency_ms > 1000` 直接标记为 `unavailable`。
+- `test_node_by_id()` 已改为调用 `test_node_real_egress(..., purity_check=False)`，单个检测不触发纯净度 API。
+- `test_multiple_nodes()` 已改为调用同一套真实出口测速逻辑，成功节点之后再走批量 IP 富集和纯净度评分。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
+### 下一步计划
+
+1. 部署到真实 Linux VPS 后点击单个“检测”，确认表格延迟与 7928 网关出口自检延迟接近。
+2. 点击“更新节点”，观察 `nodes.json` 中 `latency_ms`、`probe_message`、`egress_ip` 是否按真实出口测速更新。
+3. 如果个别系统上 `curl --interface tunX` 无法出站，再增加临时策略路由兜底，但当前优先保持“不新增端口”的轻量方案。
+
+## 2026-06-09 补充：风险值阈值与评分模型放宽
+
+### 问题记录
+
+对比 `风险值.txt` 中样例后确认，旧模型会把大量 Ping0 显示为 `2% - 11% 极度纯净` 的日本住宅/宽带节点评为 `90% - 100%`，存在明显错杀。
+
+主要原因：
+
+- 默认剔除阈值 `20%` 过严。
+- proxycheck.io 的 `vpn/proxy` 命中被当作硬剔除，容易把 VPNGate 入口节点误判为高风险。
+- 本地规则对 `host_name` 中的 `vpn`、共享 session 数、普通运营商关键词惩罚过重。
+
+### 已调整
+
+- 默认通过阈值改为 `PURITY_SCORE_THRESHOLD=60`，即风险值 `<=60%` 通过，`>60%` 才剔除。
+- 默认批量通过率保障改为 `PURITY_MIN_PASS_RATIO=99`，确保非硬剔除节点中至少 99% 通过。
+- `PURITY_CACHE_VERSION` 升级到 `3`，旧的 90%-100% 缓存不会继续生效。
+- 本地评分放宽：
+  - 住宅/移动 ISP 基本保持低风险。
+  - VPNGate session 数只作为轻微参考，不再大幅抬高风险。
+  - 不再因为 `host_name` 中出现 `vpn` 直接加重风险。
+  - 数据中心、云厂商、托管网络仍会提高风险值。
+- proxycheck.io 评分放宽：
+  - `vpn/proxy` 命中不再硬剔除，只提高风险分。
+  - 只有 `anonymous/tor` 命中才硬剔除。
+- AbuseIPDB 评分放宽：
+  - 只有 `abuseConfidenceScore >= 90` 才硬剔除。
+  - 中等滥用分只提高风险值，由批量 99% 通过率机制决定是否保留。
+- UI 风险值颜色阈值同步调整：
+  - `<=60%` 显示为低风险通过色。
+  - `61%-84%` 显示为中风险。
+  - `>=85%` 显示为高风险。
+
+### 验证结果
+
+- 普通住宅 ISP 模拟评分：`9%`。
+- 高共享住宅 ISP 模拟评分：`12%`。
+- 典型数据中心云厂商模拟评分：`72%`。
+- 100 个非硬剔除高风险节点批量校准后：`99` 个通过，`1` 个保留不可用。
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
+### 下一步计划
+
+1. 部署到 VPS 后重新点击“更新节点”，让缓存版本 `3` 重新计算风险值。
+2. 抽样对比 Ping0，如果普通住宅节点仍偏高，继续降低本地 `hosting/datacenter/proxycheck confidence` 权重。
+3. 如果高风险节点漏过较多，再只针对 AbuseIPDB 高分、Tor/匿名、强数据中心特征提高权重，不恢复大面积硬剔除。
