@@ -472,3 +472,71 @@
 1. 部署到 VPS 后重新点击“更新节点”，让缓存版本 `3` 重新计算风险值。
 2. 抽样对比 Ping0，如果普通住宅节点仍偏高，继续降低本地 `hosting/datacenter/proxycheck confidence` 权重。
 3. 如果高风险节点漏过较多，再只针对 AbuseIPDB 高分、Tor/匿名、强数据中心特征提高权重，不恢复大面积硬剔除。
+
+## 2026-06-09 补充：纯净度过滤临时旁路
+
+### 调整原因
+
+当前免费 API + 本地规则的风险值与 Ping0 对比仍不稳定，容易影响节点可用性判断。因此先临时砍掉纯净度过滤逻辑，保留代码注释以便后续恢复或重做。
+
+### 已调整
+
+- 前端 UI “风险值”列固定显示 `60%`。
+- 后端节点数据中的风险字段统一写入：
+  - `purity_score=60`
+  - `purity_raw_score=60`
+  - `purity_grade=disabled`
+  - `purity_sources=["disabled"]`
+- 点击“更新节点”时不再调用 `vpn_utils.assess_nodes_purity()`。
+- 单节点“检测”路径不触发任何纯净度计算。
+- 批量更新只做真实出口延迟检测和 IP 信息富集。
+- 节点排序不再参考 `purity_score`，只按延迟从低到高排序。
+- 延迟阈值改为 `500ms`：
+  - `0ms/超时` 标记不可用。
+  - `>500ms` 标记不可用。
+  - `<=500ms` 标记可用。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
+### 下一步计划
+
+1. 部署后点击“更新节点”，确认不会再消耗 proxycheck.io / AbuseIPDB 额度。
+2. 观察节点列表是否按真实出口延迟升序排列。
+3. 如果后续要恢复纯净度功能，优先重新设计为独立参考列，不参与节点可用性剔除。
+
+## 2026-06-09 补充：固定地区模式故障切换增强
+
+### 调整目标
+
+- 当“IP 出站路由模式”为固定地区时，先限定当前锁定国家地区，再继续遵守“IP 出站类型过滤”的所有 IP / 住宅 IP / 机房 IP 选择。
+- 当前活动节点超时或代理不可用后，先触发更新节点、真实出口延迟检测和延迟排序。
+- 排序完成后，直接切换到当前锁定地区中延迟最低的可用节点。
+- 固定地区模式增加每 30 分钟一次的当前活动节点真实出口延迟巡检。
+- 如果巡检发现当前活动节点延迟 `>1000ms`，则触发更新节点、延迟排序，并切换到该地区延迟最低节点。
+
+### 已实现
+
+- 新增 `filter_routing_candidates()`：
+  - 统一处理自动切换候选节点。
+  - 固定地区模式先按国家/地区过滤，再按 `routing_ip_type` 过滤。
+  - `routing_ip_type=all`：在当前地区所有可用出口 IP 中选延迟最低节点。
+  - `routing_ip_type=residential`：在当前地区住宅/移动 IP 中选延迟最低节点。
+  - `routing_ip_type=hosting`：在当前地区机房 IP 中选延迟最低节点。
+- 新增 `refresh_and_switch_fixed_region()`：
+  - 固定地区专用故障切换入口。
+  - 等待正在运行的节点更新任务完成；如果没有正在更新，则主动执行 `maintain_valid_nodes(force=False)`。
+  - 更新和排序完成后调用 `auto_switch_node()` 切换到最低延迟节点。
+- `background_proxy_checker()` 中固定地区模式的代理不可用处理已改为：
+  - 标记当前活动节点不可用。
+  - 触发固定地区刷新排序切换。
+- 新增 `fixed_region_latency_guard()`：
+  - 每 30 分钟运行一次。
+  - 仅在固定地区模式、连接开启、当前节点正在运行时生效。
+  - 使用现有 `check_proxy_health()` 读取 7928 真实出口延迟。
+  - 延迟 `>1000ms` 时标记当前节点不可用，并触发固定地区刷新排序切换。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。

@@ -110,6 +110,8 @@ CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+FIXED_REGION_LATENCY_CHECK_SECONDS = 30 * 60
+FIXED_REGION_LATENCY_FAILOVER_MS = 1000
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -118,6 +120,8 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+NODE_LATENCY_LIMIT_MS = 500
+PURITY_DISPLAY_FIXED_SCORE = 60
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -723,12 +727,12 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
-        "purity_score": 100,
-        "purity_raw_score": 100,
-        "purity_grade": "not_checked",
-        "purity_reasons": [],
-        "purity_sources": [],
-        "purity_checked_at": 0,
+        "purity_score": PURITY_DISPLAY_FIXED_SCORE,
+        "purity_raw_score": PURITY_DISPLAY_FIXED_SCORE,
+        "purity_grade": "disabled",
+        "purity_reasons": ["purity filter disabled"],
+        "purity_sources": ["disabled"],
+        "purity_checked_at": time.time(),
         "purity_hard_block": False,
         "latency_ms": 0,
         "config_file": str(config_path),
@@ -1158,6 +1162,15 @@ def stop_active_openvpn() -> None:
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
+def mark_purity_disabled(node: dict[str, Any]) -> None:
+    node["purity_score"] = PURITY_DISPLAY_FIXED_SCORE
+    node["purity_raw_score"] = PURITY_DISPLAY_FIXED_SCORE
+    node["purity_grade"] = "disabled"
+    node["purity_reasons"] = ["purity filter disabled"]
+    node["purity_sources"] = ["disabled"]
+    node["purity_checked_at"] = time.time()
+    node["purity_hard_block"] = False
+
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         nodes,
@@ -1165,7 +1178,6 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             parse_int(n.get("latency_ms")) if parse_int(n.get("latency_ms")) > 0 else 999999,
             0 if n.get("active") else 1,
             0 if n.get("probe_status") == "available" else 1,
-            parse_int(n.get("purity_score")) if n.get("purity_score") not in (None, "") else 100,
             -parse_int(n.get("score")),
             str(n.get("id") or ""),
         )
@@ -1323,9 +1335,9 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
     active_result = active_node_real_latency(node_id)
     if active_result is not None:
         latency = parse_int(active_result.get("latency_ms"))
-        ok = bool(active_result.get("ok")) and latency > 0 and latency <= 1000
-        message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > 1000 ms")
-        return {
+        ok = bool(active_result.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
+        message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms")
+        result = {
             "id": node_id,
             "ip": node_info.get("ip") or node_info.get("remote_host") or "",
             "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
@@ -1344,6 +1356,8 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             "quality": node_info.get("quality", ""),
             "egress_ip": active_result.get("ip", ""),
         }
+        mark_purity_disabled(result)
+        return result
 
     config_text = node_info.get("config_text") or ""
     if not config_text:
@@ -1389,11 +1403,11 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             probe = measure_interface_egress_latency(dev_name)
             latency = parse_int(probe.get("latency_ms"))
             egress_ip = str(probe.get("ip") or "")
-            ok = bool(probe.get("ok")) and latency > 0 and latency <= 1000
+            ok = bool(probe.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
             if not probe.get("ok"):
                 message = str(probe.get("error") or "egress latency probe failed")
-            elif latency > 1000:
-                message = f"Real egress latency {latency} ms > 1000 ms"
+            elif latency > NODE_LATENCY_LIMIT_MS:
+                message = f"Real egress latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms"
             else:
                 message = f"Real egress latency ok: {latency} ms"
     finally:
@@ -1424,18 +1438,14 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         "ip_type": "",
         "quality": "",
         "egress_ip": egress_ip,
-        "purity_score": node_info.get("purity_score", 100),
-        "purity_raw_score": node_info.get("purity_raw_score", 100),
-        "purity_grade": node_info.get("purity_grade", "not_checked"),
-        "purity_reasons": node_info.get("purity_reasons", []),
-        "purity_sources": node_info.get("purity_sources", []),
-        "purity_checked_at": node_info.get("purity_checked_at", 0),
-        "purity_hard_block": node_info.get("purity_hard_block", False),
     }
+    mark_purity_disabled(result)
     if ok:
         vpn_utils.enrich_ip_info([result])
-        if purity_check:
-            vpn_utils.assess_nodes_purity([result])
+        # Purity scoring/filtering is intentionally disabled. Keep the old call
+        # here commented for future rollback reference.
+        # if purity_check:
+        #     vpn_utils.assess_nodes_purity([result])
     return result
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
@@ -1479,19 +1489,25 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 res = future.result()
                 updated_nodes_map[nid] = res
             except Exception as e:
-                updated_nodes_map[nid] = {
+                error_node = {
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
+                mark_purity_disabled(error_node)
+                updated_nodes_map[nid] = error_node
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
     if successful_nodes:
         try:
             vpn_utils.enrich_ip_info(successful_nodes)
-            vpn_utils.assess_nodes_purity(successful_nodes)
+            for node in successful_nodes:
+                mark_purity_disabled(node)
+            # Purity scoring/filtering is intentionally disabled. Keep the old
+            # call commented for future rollback reference.
+            # vpn_utils.assess_nodes_purity(successful_nodes)
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
 
@@ -1505,6 +1521,75 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         write_json(NODES_FILE, sorted_nodes)
         
     return list(updated_nodes_map.values())
+
+fixed_region_failover_lock = threading.Lock()
+
+def country_matches(node: dict[str, Any], target_country: str) -> bool:
+    if not target_country:
+        return True
+    country = str(node.get("country") or "")
+    translated = vpn_utils.COUNTRY_TRANSLATIONS.get(country, country)
+    return country == target_country or translated == target_country
+
+def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any], exclude_active: bool = True) -> list[dict[str, Any]]:
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    target_country = ui_cfg.get("force_country", "")
+    candidates = [
+        n for n in nodes
+        if n.get("probe_status") == "available"
+        and (not exclude_active or not n.get("active"))
+    ]
+
+    if routing_mode == "fixed_region" and target_country:
+        candidates = [n for n in candidates if country_matches(n, target_country)]
+    elif routing_mode == "favorites":
+        fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+        fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
+        if fav_candidates:
+            candidates = fav_candidates
+        elif not ui_cfg.get("fav_fail_fallback", True):
+            candidates = []
+
+    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+    if routing_ip_type == "residential":
+        candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
+    elif routing_ip_type == "hosting":
+        candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
+
+    candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+    return candidates
+
+def refresh_and_switch_fixed_region(reason: str) -> None:
+    if not fixed_region_failover_lock.acquire(blocking=False):
+        print(f"[固定地区切换] 已有固定地区刷新切换任务运行中，跳过本次触发: {reason}", flush=True)
+        return
+    try:
+        ui_cfg = load_ui_config()
+        if ui_cfg.get("routing_mode") != "fixed_region":
+            return
+        if not ui_cfg.get("connection_enabled", True):
+            return
+        target_country = str(ui_cfg.get("force_country") or "")
+        if not target_country:
+            return
+        msg = f"固定地区模式触发刷新测速排序并切换到 {target_country} 最低延迟节点。原因: {reason}"
+        print(f"[固定地区切换] {msg}", flush=True)
+        log_to_json("INFO", "VPN", msg)
+        waited_for_existing_update = False
+        if maintenance_lock.locked():
+            waited_for_existing_update = True
+            for _ in range(60):
+                if not maintenance_lock.locked():
+                    break
+                time.sleep(5)
+        if not waited_for_existing_update:
+            maintain_valid_nodes(force=False)
+        auto_switch_node()
+    except Exception as exc:
+        print(f"[固定地区切换] 刷新测速排序并切换失败: {exc}", flush=True)
+        log_to_json("ERROR", "VPN", f"固定地区刷新切换失败: {exc}")
+    finally:
+        fixed_region_failover_lock.release()
 
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
@@ -1527,36 +1612,7 @@ def auto_switch_node(attempt: int = 0) -> None:
     # Find the next best available node
     with lock:
         nodes = read_nodes()
-        candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
-            and not n.get("active")
-        ]
-        
-        if routing_mode == "fixed_region" and target_country:
-            candidates = [
-                n for n in candidates 
-                if n.get("country") == target_country 
-                or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
-            ]
-        if routing_mode == "favorites":
-            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-            fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
-            if fav_candidates:
-                candidates = fav_candidates
-            else:
-                fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
-                if not fav_fail_fallback:
-                    candidates = []
-            
-        # Apply routing_ip_type filter
-        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-        if routing_ip_type == "residential":
-            candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
-        elif routing_ip_type == "hosting":
-            candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
-            
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+        candidates = filter_routing_candidates(nodes, ui_cfg, exclude_active=True)
         
     if candidates:
         next_node = candidates[0]
@@ -1753,7 +1809,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
-                        auto_switch_node()
+                        if routing_mode == "fixed_region":
+                            threading.Thread(
+                                target=refresh_and_switch_fixed_region,
+                                args=(f"活动节点代理不可用: {error_msg}",),
+                                daemon=True,
+                            ).start()
+                        else:
+                            auto_switch_node()
                         is_connecting = True
 
         try:
@@ -1846,30 +1909,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     target_country = ui_cfg.get("force_country", "")
                     
                     if routing_mode != "fixed_ip":
-                        available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                        if routing_mode == "fixed_region" and target_country:
-                            available_candidates = [
-                                n for n in available_candidates 
-                                if n.get("country") == target_country 
-                                or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
-                            ]
-                        elif routing_mode == "favorites":
-                            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-                            fav_candidates = [n for n in available_candidates if n.get("id") in fav_ids]
-                            if fav_candidates:
-                                available_candidates = fav_candidates
-                            else:
-                                fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
-                                if not fav_fail_fallback:
-                                    available_candidates = []
-                        
-                        # Apply routing_ip_type filter for auto-connect
-                        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-                        if routing_ip_type == "residential":
-                            available_candidates = [n for n in available_candidates if n.get("ip_type") in ("residential", "mobile")]
-                        elif routing_ip_type == "hosting":
-                            available_candidates = [n for n in available_candidates if n.get("ip_type") == "hosting"]
-                        
+                        available_candidates = filter_routing_candidates(merged, ui_cfg, exclude_active=True)
                         if available_candidates:
                             auto_switch_node()
 
@@ -3641,15 +3681,10 @@ function displayLatencyForNode(n, activeNodeId) {
 }
 
 function riskDisplay(n) {
-  if (!n || !n.purity_checked_at) return { text: "-", cls: "", title: "未进行纯净度评估" };
-  const score = parseInt(n.purity_score || 0);
-  const rawScore = parseInt(n.purity_raw_score || score || 0);
-  const cls = score <= 60 ? "latency-good" : (score < 85 ? "latency-medium" : "latency-poor");
-  const reasons = Array.isArray(n.purity_reasons) ? n.purity_reasons.join("; ") : "";
   return {
-    text: `${score}%`,
-    cls,
-    title: `风险值 ${score}% / 原始 ${rawScore}%${reasons ? " | " + reasons : ""}`
+    text: "60%",
+    cls: "latency-good",
+    title: "纯净度过滤已关闭，风险值固定显示 60%"
   };
 }
 
@@ -5057,6 +5092,45 @@ def active_node_pinger() -> None:
             print(f"[ERROR] active_node_pinger error: {e}", flush=True)
         time.sleep(10)
 
+def fixed_region_latency_guard() -> None:
+    time.sleep(60)
+    while True:
+        try:
+            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
+            ui_cfg = load_ui_config()
+            if ui_cfg.get("routing_mode") != "fixed_region":
+                continue
+            if not ui_cfg.get("connection_enabled", True):
+                continue
+            if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
+                continue
+
+            result = check_proxy_health()
+            if not result.get("ok"):
+                continue
+            latency = parse_int(result.get("latency_ms"))
+            set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
+            if latency <= FIXED_REGION_LATENCY_FAILOVER_MS:
+                continue
+
+            reason = f"固定地区半小时巡检发现当前节点真实出口延迟 {latency} ms > {FIXED_REGION_LATENCY_FAILOVER_MS} ms"
+            print(f"[固定地区延迟巡检] {reason}", flush=True)
+            log_to_json("WARNING", "VPN", reason)
+            with lock:
+                nodes = read_nodes()
+                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                if active_node:
+                    mark_blacklisted(active_node, reason)
+                    active_node["probe_status"] = "unavailable"
+                    active_node["probe_message"] = reason
+                    active_node["latency_ms"] = latency
+                    write_json(NODES_FILE, sort_all_nodes(nodes))
+
+            refresh_and_switch_fixed_region(reason)
+        except Exception as exc:
+            print(f"[固定地区延迟巡检] 执行异常: {exc}", flush=True)
+            log_to_json("ERROR", "VPN", f"固定地区延迟巡检异常: {exc}")
+
 
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
@@ -5730,6 +5804,7 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=fixed_region_latency_guard, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
