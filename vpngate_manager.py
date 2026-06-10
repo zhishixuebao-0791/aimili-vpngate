@@ -111,7 +111,7 @@ TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 FIXED_REGION_LATENCY_CHECK_SECONDS = 30 * 60
-FIXED_REGION_LATENCY_FAILOVER_MS = 1000
+FIXED_REGION_LATENCY_FAILOVER_MS = 500
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -185,6 +185,12 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
+
+def save_ui_config(ui_cfg: dict[str, Any]) -> None:
+    auth_file = DATA_DIR / "ui_auth.json"
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def normalize_ip_value(value: Any) -> str:
     ip = str(value or "").strip()
@@ -294,10 +300,13 @@ def add_manual_blacklist_ip(ip: str, reason: str = "manual blacklist") -> dict[s
     save_manual_blacklist(data)
     apply_manual_blacklist_to_storage()
     cleanup_favorite_node_ids()
-    disconnect_active_if_manual_blacklisted(normalized)
+    disconnected = disconnect_active_if_manual_blacklisted(normalized)
+    remove_nodes_by_ips({normalized})
+    if disconnected:
+        switch_to_best_current_available(f"手动拉黑当前活动节点 IP: {normalized}", exclude_ids=set())
     return data[normalized]
 
-def remove_manual_blacklist_ip(ip: str) -> bool:
+def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
     normalized = normalize_ip_value(ip)
     if not normalized:
         raise ValueError("请输入有效 IP")
@@ -306,22 +315,50 @@ def remove_manual_blacklist_ip(ip: str) -> bool:
     if existed:
         data.pop(normalized, None)
         save_manual_blacklist(data)
-    return existed
+    removed_node_ids: set[str] = set()
+    restored_node_ids: set[str] = set()
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict) or node_ip_value(node) != normalized:
+                    continue
+                latency = parse_int(node.get("latency_ms"))
+                if latency > 0 and latency <= NODE_LATENCY_LIMIT_MS:
+                    node["manual_blacklisted"] = False
+                    node.pop("blacklisted_ip", None)
+                    node["probe_status"] = "available"
+                    node["probe_message"] = f"Manual blacklist removed: {normalized}"
+                    restored_node_ids.add(str(node.get("id") or ""))
+                else:
+                    removed_node_ids.add(str(node.get("id") or ""))
+            if removed_node_ids:
+                nodes = [n for n in nodes if not (isinstance(n, dict) and str(n.get("id") or "") in removed_node_ids)]
+            write_json(NODES_FILE, sort_all_nodes([n for n in nodes if isinstance(n, dict)]))
+    return {
+        "existed": existed,
+        "removed_node_ids": sorted(removed_node_ids),
+        "restored_node_ids": sorted(restored_node_ids),
+    }
 
-def disconnect_active_if_manual_blacklisted(ip: str) -> None:
+def disconnect_active_if_manual_blacklisted(ip: str) -> bool:
     global active_openvpn_node_id
     if not ip or not active_openvpn_node_id:
-        return
+        return False
     nodes = read_json(NODES_FILE, [])
     if not isinstance(nodes, list):
-        return
+        return False
     active_node = next((node for node in nodes if isinstance(node, dict) and node.get("id") == active_openvpn_node_id), None)
     if active_node and node_ip_value(active_node) == ip:
+        old_active_id = active_openvpn_node_id
         stop_active_openvpn()
+        active_openvpn_node_id = ""
         active_node["active"] = False
         apply_manual_blacklist_to_node(active_node)
         write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", active_node_latency="无活动连接", last_check_message=f"手动拉黑当前节点 IP: {ip}")
+        return bool(old_active_id)
+    return False
 
 import hashlib
 import random
@@ -361,7 +398,7 @@ def load_ui_config() -> dict[str, Any]:
             "host": UI_HOST,
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
-            "routing_mode": "auto",
+            "routing_mode": "fixed_ip",
             "force_country": "",
             "routing_ip_type": "all",
             "connection_enabled": True,
@@ -518,7 +555,7 @@ def get_state() -> dict[str, Any]:
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
-    state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
+    state["routing_mode"] = ui_cfg.get("routing_mode", "fixed_ip")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
@@ -1328,6 +1365,147 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     )
 
+def merge_nodes_preserve_old(old_nodes: list[dict[str, Any]], new_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    old_map = {str(n.get("id") or ""): n for n in old_nodes if isinstance(n, dict)}
+    for node in old_nodes:
+        node_id = str(node.get("id") or "")
+        if node_id and node_id not in seen_ids:
+            merged.append(node)
+            seen_ids.add(node_id)
+    for node in new_nodes:
+        node_id = str(node.get("id") or "")
+        if not node_id or node_id in seen_ids:
+            continue
+        old = old_map.get(node_id)
+        if old:
+            preserved = node.copy()
+            for key in (
+                "probe_status",
+                "probe_message",
+                "probed_at",
+                "latency_ms",
+                "owner",
+                "asn",
+                "as_name",
+                "location",
+                "ip_type",
+                "quality",
+                "egress_ip",
+                "manual_blacklisted",
+                "blacklisted_ip",
+            ):
+                if key in old:
+                    preserved[key] = old[key]
+            merged.append(preserved)
+        else:
+            merged.append(node)
+        seen_ids.add(node_id)
+    return merged
+
+def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    keep_ids = keep_ids or set()
+    kept: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        if (
+            node.get("probe_status") == "available"
+            or node_id in favorite_ids
+            or node_id in keep_ids
+        ):
+            kept.append(node)
+    return sort_all_nodes(kept)
+
+def node_passes_current_latency(node: dict[str, Any] | None) -> bool:
+    if not node:
+        return False
+    latency = parse_int(node.get("latency_ms"))
+    return latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
+
+def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool:
+    if not node:
+        return False
+    latency = parse_int(node.get("latency_ms"))
+    return latency > NODE_LATENCY_LIMIT_MS
+
+def remove_nodes_by_ids(node_ids: set[str]) -> None:
+    if not node_ids:
+        return
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        if not isinstance(nodes, list):
+            return
+        kept = [n for n in nodes if not (isinstance(n, dict) and str(n.get("id") or "") in node_ids)]
+        if len(kept) != len(nodes):
+            write_json(NODES_FILE, sort_all_nodes(kept))
+
+def remove_nodes_by_ips(ips: set[str]) -> list[str]:
+    normalized = {normalize_ip_value(ip) for ip in ips}
+    normalized.discard("")
+    if not normalized:
+        return []
+    removed: list[str] = []
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        if not isinstance(nodes, list):
+            return []
+        kept = []
+        for node in nodes:
+            if isinstance(node, dict) and node_ip_value(node) in normalized:
+                removed.append(str(node.get("id") or ""))
+                continue
+            kept.append(node)
+        if removed:
+            write_json(NODES_FILE, sort_all_nodes(kept))
+    return removed
+
+def switch_to_best_current_available(reason: str, exclude_ids: set[str] | None = None) -> bool:
+    exclude_ids = exclude_ids or set()
+    nodes = read_nodes()
+    candidates = [
+        n for n in nodes
+        if n.get("probe_status") == "available"
+        and not n.get("manual_blacklisted")
+        and str(n.get("id") or "") not in exclude_ids
+        and node_passes_current_latency(n)
+    ]
+    candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, str(n.get("id") or "")))
+    if not candidates:
+        set_state(last_check_message=f"{reason}; 当前列表没有可切换的非拉黑可用节点")
+        return False
+    connect_node(candidates[0]["id"])
+    set_state(last_check_message=f"{reason}; 已切换到当前列表最低延迟节点 {candidates[0]['id']}")
+    return True
+
+def enforce_active_not_manual_blacklisted() -> bool:
+    global active_openvpn_node_id
+    manual = load_manual_blacklist()
+    if not manual or not active_openvpn_node_id:
+        return False
+    nodes = read_json(NODES_FILE, [])
+    if not isinstance(nodes, list):
+        return False
+    active_node = next((n for n in nodes if isinstance(n, dict) and n.get("id") == active_openvpn_node_id), None)
+    if not active_node:
+        return False
+    ip = node_ip_value(active_node)
+    if not ip or ip not in manual:
+        return False
+    old_id = str(active_node.get("id") or "")
+    active_node["active"] = False
+    active_node["manual_blacklisted"] = True
+    active_node["blacklisted_ip"] = ip
+    active_node["probe_status"] = "unavailable"
+    active_node["probe_message"] = f"Active node is manually blacklisted: {ip}"
+    write_json(NODES_FILE, sort_all_nodes(nodes))
+    stop_active_openvpn()
+    active_openvpn_node_id = ""
+    remove_nodes_by_ips({ip})
+    set_state(active_openvpn_node_id="", active_node_latency="无活动连接", last_check_message=f"当前活动节点命中拉黑 IP，已断开: {ip}")
+    switch_to_best_current_available(f"当前活动节点命中拉黑 IP: {ip}", exclude_ids={old_id})
+    return True
+
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
 
@@ -1642,7 +1820,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         else:
             return {}
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -1693,7 +1871,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             apply_manual_blacklist_to_node(n, manual)
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
-        cleanup_favorite_node_ids(sorted_nodes)
+        if cleanup_favorites:
+            cleanup_favorite_node_ids(sorted_nodes)
         
     return list(updated_nodes_map.values())
 
@@ -1763,7 +1942,11 @@ def cleanup_favorite_node_ids(nodes: list[dict[str, Any]] | None = None) -> list
     if nodes is None:
         nodes = read_nodes()
     node_map = {str(n.get("id") or ""): n for n in nodes if isinstance(n, dict)}
-    cleaned = [node_id for node_id in fav_ids if node_can_be_favorited(node_map.get(node_id))]
+    cleaned = [
+        node_id
+        for node_id in fav_ids
+        if node_map.get(node_id) is not None and not node_map[node_id].get("manual_blacklisted")
+    ]
     if cleaned != fav_ids:
         ui_cfg["favorite_node_ids"] = cleaned
         auth_file = DATA_DIR / "ui_auth.json"
@@ -1782,22 +1965,10 @@ def refresh_and_switch_fixed_region(reason: str) -> None:
             return
         if not ui_cfg.get("connection_enabled", True):
             return
-        target_country = str(ui_cfg.get("force_country") or "")
-        if not target_country:
-            return
-        msg = f"固定地区模式触发刷新测速排序并切换到 {target_country} 最低延迟节点。原因: {reason}"
+        msg = f"固定地区模式触发新旧节点合并测速排序。原因: {reason}"
         print(f"[固定地区切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
-        waited_for_existing_update = False
-        if maintenance_lock.locked():
-            waited_for_existing_update = True
-            for _ in range(60):
-                if not maintenance_lock.locked():
-                    break
-                time.sleep(5)
-        if not waited_for_existing_update:
-            maintain_valid_nodes(force=False)
-        auto_switch_node()
+        refresh_test_prune_and_maybe_switch(reason)
     except Exception as exc:
         print(f"[固定地区切换] 刷新测速排序并切换失败: {exc}", flush=True)
         log_to_json("ERROR", "VPN", f"固定地区刷新切换失败: {exc}")
@@ -1820,33 +1991,10 @@ def refresh_and_switch_fixed_favorites(reason: str) -> None:
             set_state(last_check_message="固定收藏菜单模式没有收藏节点，无法自动切换")
             return
 
-        msg = f"固定收藏菜单模式触发收藏节点测速排序并切换到最低延迟节点。原因: {reason}"
+        msg = f"固定收藏菜单模式触发新旧节点合并测速排序。原因: {reason}"
         print(f"[固定收藏切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
-
-        with lock:
-            nodes = read_nodes()
-            existing_fav_ids = [n["id"] for n in nodes if n.get("id") in fav_ids]
-
-        if existing_fav_ids:
-            test_multiple_nodes(existing_fav_ids)
-
-        with lock:
-            nodes = read_nodes()
-            cleanup_favorite_node_ids(nodes)
-            ui_cfg = load_ui_config()
-            candidates = filter_routing_candidates(nodes, ui_cfg, exclude_active=False)
-
-        if not candidates:
-            set_state(last_check_message="固定收藏菜单模式没有可用收藏节点，无法自动切换")
-            return
-
-        next_node = candidates[0]
-        if next_node.get("id") == active_openvpn_node_id and active_openvpn_running():
-            set_state(last_check_message=f"固定收藏菜单已完成测速排序，当前活动节点已是最低延迟收藏节点: {next_node.get('id')}")
-            return
-
-        connect_node(next_node["id"])
+        refresh_test_prune_and_maybe_switch(reason)
     except Exception as exc:
         print(f"[固定收藏切换] 收藏节点测速排序并切换失败: {exc}", flush=True)
         log_to_json("ERROR", "VPN", f"固定收藏刷新切换失败: {exc}")
@@ -1904,12 +2052,105 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         def bg_fetch_and_switch():
             try:
-                maintain_valid_nodes(force=False)
-                auto_switch_node()
+                refresh_test_prune_and_maybe_switch("auto switch fallback")
             except Exception as e:
                 print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+
+def refresh_test_prune_and_maybe_switch(reason: str) -> str:
+    global active_openvpn_node_id, is_connecting
+    ensure_dirs()
+    if not maintenance_lock.acquire(blocking=False):
+        msg = "高延迟刷新任务正在运行，跳过本次触发"
+        set_state(last_check_message=msg)
+        return msg
+
+    previous_connecting = is_connecting
+    is_connecting = True
+    active_id = active_openvpn_node_id
+    try:
+        ui_cfg = load_ui_config()
+        routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+        fav_ids = set(favorite_node_ids(ui_cfg))
+        fixed_ip_mode = routing_mode == "fixed_ip"
+
+        set_state(is_connecting=True, last_check_message=f"正在拉取新节点并合并旧节点测速排序: {reason}")
+        old_nodes = read_nodes()
+        old_by_id = {str(n.get("id") or ""): n for n in old_nodes if isinstance(n, dict)}
+        new_nodes = fetch_candidates()
+        merged = merge_nodes_preserve_old(old_nodes, new_nodes)
+
+        with lock:
+            if len(merged) > 1000:
+                merged = merged[:1000]
+            for n in merged:
+                node_id = str(n.get("id") or "")
+                if node_id and node_id not in old_by_id:
+                    n["probe_status"] = "testing"
+                    n["probe_message"] = "Testing latency before publishing final status"
+                    n["latency_ms"] = 0
+                config_path_value = n.get("config_file")
+                if config_path_value:
+                    config_path = Path(config_path_value)
+                    if not config_path.exists() and n.get("config_text"):
+                        try:
+                            config_path.write_text(n["config_text"], encoding="utf-8")
+                        except Exception:
+                            pass
+            write_json(NODES_FILE, merged)
+
+        test_ids = [str(n.get("id") or "") for n in merged if n.get("id")]
+        if test_ids:
+            test_multiple_nodes(test_ids, cleanup_favorites=False)
+
+        with lock:
+            tested_nodes = read_nodes()
+            for node in tested_nodes:
+                if node.get("id") == active_id:
+                    node["latency_ms"] = max(parse_int(node.get("latency_ms")), NODE_LATENCY_LIMIT_MS + 1)
+                    if not fixed_ip_mode:
+                        node["active"] = False
+                        node["probe_status"] = "unavailable"
+                        node["probe_message"] = reason
+                elif not fixed_ip_mode:
+                    node["active"] = False
+
+            if not fixed_ip_mode and active_id:
+                stop_active_openvpn()
+                active_openvpn_node_id = ""
+
+            keep_ids = {active_id} if fixed_ip_mode and active_id else set()
+            pruned = prune_failed_nodes(tested_nodes, fav_ids, keep_ids=keep_ids)
+            write_json(NODES_FILE, pruned)
+
+        if fixed_ip_mode:
+            msg = "固定 IP 模式已完成新旧节点测速与剔除；当前连接不自动切换"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        ui_cfg = load_ui_config()
+        candidates = filter_routing_candidates(pruned, ui_cfg, exclude_active=False)
+        if not candidates:
+            msg = "节点测速排序完成，但没有符合当前路由模式的可用节点"
+            set_state(active_openvpn_node_id="", is_connecting=False, last_check_message=msg, active_node_latency="无活动连接")
+            return msg
+
+        next_node = candidates[0]
+        is_connecting = False
+        connect_node(next_node["id"])
+        msg = f"节点测速排序完成，已切换到最低延迟节点: {next_node['id']}"
+        set_state(last_check_message=msg)
+        return msg
+    except Exception as exc:
+        msg = f"高延迟刷新失败: {exc}"
+        print(f"[高延迟刷新] {msg}", flush=True)
+        log_to_json("ERROR", "VPN", msg)
+        set_state(last_check_message=msg)
+        raise
+    finally:
+        is_connecting = previous_connecting if active_openvpn_node_id else False
+        maintenance_lock.release()
 
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -2008,10 +2249,13 @@ def connect_node(node_id: str) -> str:
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
         if res["ok"]:
+            proxy_latency = parse_int(res.get("latency_ms"))
+            if proxy_latency > 0:
+                last_active_latency = proxy_latency
             set_state(
                 proxy_ok=True,
                 proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
+                proxy_latency_ms=proxy_latency,
                 proxy_error=""
             )
         else:
@@ -2022,7 +2266,7 @@ def connect_node(node_id: str) -> str:
                 proxy_error=res.get("error", "未知错误")
             )
             
-        latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
+        latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
@@ -2074,20 +2318,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
-                        if routing_mode == "fixed_region":
-                            threading.Thread(
-                                target=refresh_and_switch_fixed_region,
-                                args=(f"活动节点代理不可用: {error_msg}",),
-                                daemon=True,
-                            ).start()
-                        elif routing_mode == "fixed_favorites":
-                            threading.Thread(
-                                target=refresh_and_switch_fixed_favorites,
-                                args=(f"活动节点代理不可用: {error_msg}",),
-                                daemon=True,
-                            ).start()
-                        else:
-                            auto_switch_node()
+                        auto_switch_node()
                         is_connecting = True
 
         try:
@@ -2176,20 +2407,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
-                    routing_mode = ui_cfg.get("routing_mode", "auto")
+                    routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
                     target_country = ui_cfg.get("force_country", "")
                     
                     if routing_mode != "fixed_ip":
                         available_candidates = filter_routing_candidates(merged, ui_cfg, exclude_active=True)
                         if available_candidates:
-                            if routing_mode == "fixed_favorites":
-                                threading.Thread(
-                                    target=refresh_and_switch_fixed_favorites,
-                                    args=("维护更新后检测到当前没有活动连接",),
-                                    daemon=True,
-                                ).start()
-                            else:
-                                auto_switch_node()
+                            auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
@@ -2213,12 +2437,16 @@ def collector_loop() -> None:
         last_collector_heartbeat = time.time()
         success = False
         try:
-            print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
-            log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
-            res = maintain_valid_nodes(force=False)
-            if "没有拉取到新节点" not in res:
+            if not cached_nodes():
+                print("[守护线程] 当前没有节点缓存，执行首次节点拉取与可用性检测...", flush=True)
+                log_to_json("INFO", "Main", "当前没有节点缓存，执行首次节点拉取与可用性检测...")
+                res = refresh_test_prune_and_maybe_switch("first startup")
+                if "没有拉取到新节点" not in res:
+                    success = True
+                log_to_json("INFO", "Main", f"首次同步与检测任务完成，结果: {res}")
+            else:
                 success = True
-            log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
+                set_state(last_check_message="节点缓存已存在，后台不再无条件刷新；仅在活动节点延迟超过阈值时刷新")
         except Exception as exc:
             err_msg = f"周期节点同步任务执行异常: {exc}"
             print(f"[错误] {err_msg}", flush=True)
@@ -2994,6 +3222,24 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(245, 158, 11, 0.2);
     }
 
+    .testing {
+      background: rgba(59, 130, 246, 0.12);
+      color: #93c5fd;
+      border-color: rgba(59, 130, 246, 0.24);
+    }
+
+    .testing-dots::after {
+      content: "";
+      animation: testingDots 1.2s steps(4, end) infinite;
+    }
+
+    @keyframes testingDots {
+      0% { content: ""; }
+      25% { content: "."; }
+      50% { content: ".."; }
+      75%, 100% { content: "..."; }
+    }
+
     .current-badge {
       background: rgba(99, 102, 241, 0.15);
       color: #818cf8;
@@ -3534,13 +3780,13 @@ INDEX_HTML = r"""<!doctype html>
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站路由模式</label>
-            <input type="hidden" id="net_routing_mode" value="auto">
+            <input type="hidden" id="net_routing_mode" value="fixed_ip">
             <div class="option-group" id="routing_mode_group">
-              <div class="option-card active" data-value="auto" onclick="setRoutingMode('auto')">
+              <div class="option-card" data-value="auto" onclick="setRoutingMode('auto')">
                 <div class="option-card-title">自动配置</div>
                 <div class="option-card-desc">智能切换，最稳定</div>
               </div>
-              <div class="option-card" data-value="fixed_ip" onclick="setRoutingMode('fixed_ip')">
+              <div class="option-card active" data-value="fixed_ip" onclick="setRoutingMode('fixed_ip')">
                 <div class="option-card-title">固定 IP</div>
                 <div class="option-card-desc">锁定IP，不自动切换</div>
               </div>
@@ -3799,7 +4045,7 @@ const translateCountry = c => {
 };
 
 const translateStatus = s => {
-  const dict = {"available": "可用", "unavailable": "不可用", "not_checked": "待检测"};
+  const dict = {"available": "可用", "unavailable": "不可用", "not_checked": "待检测", "testing": "测试中<span class=\"testing-dots\"></span>"};
   return dict[s] || s || "待检测";
 };
 
@@ -3871,6 +4117,9 @@ function getFilteredNodes() {
     }
     const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
     if (showFavoritesOnly && !favoriteIds.includes(n.id)) {
+      return false;
+    }
+    if (showBlacklistPanel && !n.manual_blacklisted) {
       return false;
     }
     return true;
@@ -4063,7 +4312,10 @@ function render(){
 
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    const emptyMsg = showBlacklistPanel
+      ? "当前主节点列表中没有命中的拉黑节点，可在上方拉黑菜单中查看或管理持久拉黑 IP。"
+      : (showFavoritesOnly ? "未找到符合过滤条件的收藏节点。" : "未找到符合过滤条件的备选节点。");
+    $("rows").innerHTML = `<tr><td colspan="10" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyMsg}</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -4095,15 +4347,17 @@ function render(){
       
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
-      const favoriteDisabled = isManualBlacklisted || n.probe_status !== "available";
-      const favBtn = favoriteDisabled
-        ? `<button class="test-btn" disabled style="color: var(--text-secondary); border-color: var(--border-color); opacity: 0.45; padding: 0 8px; height: 30px; cursor:not-allowed;">☆ 不可收藏</button>`
-        : (isFav 
+      const favoriteDisabled = !isFav && (isManualBlacklisted || n.probe_status !== "available");
+      const favBtn = isFav
         ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
+        : (favoriteDisabled
+        ? `<button class="test-btn" disabled style="color: var(--text-secondary); border-color: var(--border-color); opacity: 0.45; padding: 0 8px; height: 30px; cursor:not-allowed;">☆ 不可收藏</button>`
         : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`);
 
       const blacklistBtn = n.manual_blacklisted
         ? `<button class="test-btn" disabled style="color: var(--danger); border-color: rgba(244,63,94,0.4); opacity: 0.8; padding: 0 8px; height: 30px;">已拉黑</button>`
+        : isFav
+        ? `<button class="test-btn" disabled style="color: var(--text-secondary); border-color: var(--border-color); opacity: 0.45; padding: 0 8px; height: 30px; cursor:not-allowed;">拉黑</button>`
         : `<button class="test-btn" style="color: var(--danger); border-color: rgba(244,63,94,0.35); padding: 0 8px; height: 30px;" onclick="blacklistNode('${esc(n.ip||n.remote_host)}', event)">拉黑</button>`;
 
       return `<tr ${rowClass}>
@@ -4196,6 +4450,10 @@ async function toggleFavorite(id, event) {
     const result = await response.json();
     if (result.ok) {
       state.favorite_node_ids = Array.isArray(result.favorite_node_ids) ? result.favorite_node_ids : [];
+      if (Array.isArray(result.removed_node_ids) && result.removed_node_ids.length) {
+        const removed = new Set(result.removed_node_ids);
+        nodes = nodes.filter(n => n && !removed.has(n.id));
+      }
       render();
     } else {
       showBlacklistMessage(result.error || "该节点当前不能收藏");
@@ -4357,7 +4615,12 @@ $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
   $("refresh").textContent="正在后台更新..."; 
-  try{await fetch("./api/refresh_nodes",{method:"POST"}); await load();} 
+  try{
+    await fetch("./api/refresh_nodes",{method:"POST"});
+    state.is_connecting = true;
+    startConnectionPolling();
+    await load();
+  } 
   catch(e){}
   setTimeout(()=>{
     $("refresh").disabled=false; 
@@ -4613,7 +4876,7 @@ function updateFavPanelUI() {
 
 async function toggleFavRouting() {
   if (!state) return;
-  const newMode = (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") ? "auto" : "favorites";
+  const newMode = (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") ? "fixed_ip" : "favorites";
   
   state.routing_mode = newMode;
   updateFavPanelUI();
@@ -4657,7 +4920,7 @@ async function handleFavFallbackChange(checked) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        routing_mode: state.routing_mode || "auto",
+        routing_mode: state.routing_mode || "fixed_ip",
         force_country: state.force_country || "",
         routing_ip_type: state.routing_ip_type || "all",
         fav_fail_fallback: checked
@@ -4892,7 +5155,7 @@ function openNetworkModal() {
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
-    const mode = state.routing_mode || "auto";
+    const mode = state.routing_mode || "fixed_ip";
     const ipType = state.routing_ip_type || "all";
     
     selectOptionCard('routing_mode', mode);
@@ -5005,9 +5268,9 @@ async function logoutAdmin() {
 // 页面加载时自动初始化数据
 load();
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
+// 每 10 秒在前台自动更新节点与状态。后台刷新时也继续轮询，便于显示“测试中...”。
 setInterval(async () => {
-  if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
+  if (typeof state !== "undefined" && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
       const r = await fetch("./api/nodes");
       const d = await r.json();
@@ -5333,6 +5596,9 @@ def background_proxy_checker() -> None:
             if is_connecting:
                 time.sleep(5)
                 continue
+            if enforce_active_not_manual_blacklisted():
+                time.sleep(5)
+                continue
 
             res = check_proxy_health()
             if res["ok"]:
@@ -5368,20 +5634,7 @@ def background_proxy_checker() -> None:
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
                                 cleanup_favorite_node_ids(nodes)
-                        if routing_mode == "fixed_region":
-                            threading.Thread(
-                                target=refresh_and_switch_fixed_region,
-                                args=(f"代理连通性检测失败: {error_msg}",),
-                                daemon=True,
-                            ).start()
-                        elif routing_mode == "fixed_favorites":
-                            threading.Thread(
-                                target=refresh_and_switch_fixed_favorites,
-                                args=(f"代理连通性检测失败: {error_msg}",),
-                                daemon=True,
-                            ).start()
-                        else:
-                            auto_switch_node()
+                        auto_switch_node()
                     else:
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
@@ -5400,22 +5653,12 @@ def active_node_pinger() -> None:
         last_pinger_heartbeat = time.time()
         try:
             if active_openvpn_running() and active_openvpn_node_id:
-                nodes = read_nodes()
-                node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                if node:
-                    ip = node.get("ip") or node.get("remote_host")
-                    port = parse_int(node.get("remote_port"))
-                    fallback = parse_int(node.get("ping"))
-                    if ip:
-                        latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-                        if latency > 0:
-                            set_state(active_node_latency=f"{latency} ms")
-                        else:
-                            set_state(active_node_latency="检测超时")
-                    else:
-                        set_state(active_node_latency="检测超时")
+                state = read_json(STATE_FILE, {})
+                latency = parse_int(state.get("proxy_latency_ms"))
+                if state.get("proxy_ok") and latency > 0:
+                    set_state(active_node_latency=f"{latency} ms")
                 else:
-                    set_state(active_node_latency="检测超时")
+                    set_state(active_node_latency="等待出口检测")
             elif is_connecting:
                 set_state(active_node_latency="测试中...")
             else:
@@ -5435,6 +5678,8 @@ def fixed_region_latency_guard() -> None:
             if not ui_cfg.get("connection_enabled", True):
                 continue
             if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
+                continue
+            if enforce_active_not_manual_blacklisted():
                 continue
 
             result = check_proxy_health()
@@ -5476,6 +5721,8 @@ def fixed_favorites_latency_guard() -> None:
                 continue
             if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
                 continue
+            if enforce_active_not_manual_blacklisted():
+                continue
 
             result = check_proxy_health()
             if not result.get("ok"):
@@ -5503,6 +5750,36 @@ def fixed_favorites_latency_guard() -> None:
         except Exception as exc:
             print(f"[固定收藏延迟巡检] 执行异常: {exc}", flush=True)
             log_to_json("ERROR", "VPN", f"固定收藏延迟巡检异常: {exc}")
+
+def active_latency_refresh_guard() -> None:
+    time.sleep(60)
+    while True:
+        try:
+            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
+            ui_cfg = load_ui_config()
+            routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+            if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites", "fixed_favorites"):
+                continue
+            if not ui_cfg.get("connection_enabled", True):
+                continue
+            if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
+                continue
+
+            result = check_proxy_health()
+            if not result.get("ok"):
+                continue
+            latency = parse_int(result.get("latency_ms"))
+            set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
+            if latency <= NODE_LATENCY_LIMIT_MS:
+                continue
+
+            reason = f"{routing_mode} mode active node egress latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms"
+            print(f"[活动节点延迟巡检] {reason}", flush=True)
+            log_to_json("WARNING", "VPN", reason)
+            refresh_test_prune_and_maybe_switch(reason)
+        except Exception as exc:
+            print(f"[活动节点延迟巡检] 执行异常: {exc}", flush=True)
+            log_to_json("ERROR", "VPN", f"活动节点延迟巡检异常: {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5902,7 +6179,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 
                 new_proxy_port = payload.get("proxy_port")
-                routing_mode = str(payload.get("routing_mode") or "auto").strip()
+                routing_mode = str(payload.get("routing_mode") or "fixed_ip").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 
@@ -5950,12 +6227,6 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
                     self.send_json({"ok": True, "restart_needed": False, "message": "配置更新成功，已即时生效！"})
-                    if routing_mode == "fixed_favorites" and ui_cfg.get("connection_enabled", True):
-                        threading.Thread(
-                            target=refresh_and_switch_fixed_favorites,
-                            args=("settings switched to fixed_favorites",),
-                            daemon=True,
-                        ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -5963,7 +6234,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/update_routing":
             try:
                 payload = self.read_json_body()
-                routing_mode = str(payload.get("routing_mode") or "auto").strip()
+                routing_mode = str(payload.get("routing_mode") or "fixed_ip").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 fav_fail_fallback = bool(payload.get("fav_fail_fallback", True))
@@ -5988,12 +6259,6 @@ class Handler(BaseHTTPRequestHandler):
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
                 self.send_json({"ok": True, "message": "出站路由配置更新成功，已即时生效！"})
-                if routing_mode == "fixed_favorites" and ui_cfg.get("connection_enabled", True):
-                    threading.Thread(
-                        target=refresh_and_switch_fixed_favorites,
-                        args=("routing switched to fixed_favorites",),
-                        daemon=True,
-                    ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -6008,9 +6273,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(fav_ids, list):
                     fav_ids = []
                 fav_ids = favorite_node_ids({"favorite_node_ids": fav_ids})
+                removed_node_ids: list[str] = []
                 
                 if node_id in fav_ids:
                     fav_ids.remove(node_id)
+                    nodes = read_nodes()
+                    node = next((n for n in nodes if n.get("id") == node_id), None)
+                    if node_should_be_removed_after_unfavorite(node):
+                        remove_nodes_by_ids({node_id})
+                        removed_node_ids.append(node_id)
                 else:
                     nodes = read_nodes()
                     node = next((n for n in nodes if n.get("id") == node_id), None)
@@ -6023,12 +6294,9 @@ class Handler(BaseHTTPRequestHandler):
                     fav_ids.append(node_id)
                 
                 ui_cfg["favorite_node_ids"] = fav_ids
-                auth_file = DATA_DIR / "ui_auth.json"
-                with lock:
-                    DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                save_ui_config(ui_cfg)
                 
-                self.send_json({"ok": True, "favorite_node_ids": fav_ids})
+                self.send_json({"ok": True, "favorite_node_ids": fav_ids, "removed_node_ids": removed_node_ids})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -6050,8 +6318,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body()
                 ip = str(payload.get("ip") or "").strip()
-                existed = remove_manual_blacklist_ip(ip)
-                self.send_json({"ok": True, "removed": existed, "items": manual_blacklist_entries()})
+                result = remove_manual_blacklist_ip(ip)
+                self.send_json({"ok": True, "removed": result.get("existed", False), "result": result, "items": manual_blacklist_entries()})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
@@ -6060,7 +6328,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+                self.send_json({"ok": True, "message": refresh_test_prune_and_maybe_switch("manual update")})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
@@ -6068,8 +6336,8 @@ class Handler(BaseHTTPRequestHandler):
                 if maintenance_lock.locked():
                     self.send_json({"ok": True, "message": "节点维护任务正在运行，请稍后再试", "running": True})
                 else:
-                    threading.Thread(target=maintain_valid_nodes, args=(False,), daemon=True).start()
-                    self.send_json({"ok": True, "message": "已在后台启动节点更新流程", "running": False})
+                    threading.Thread(target=refresh_test_prune_and_maybe_switch, args=("manual update",), daemon=True).start()
+                    self.send_json({"ok": True, "message": "已在后台启动新旧节点合并测速排序流程", "running": False})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
@@ -6234,8 +6502,7 @@ def main() -> None:
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
-    threading.Thread(target=fixed_region_latency_guard, daemon=True).start()
-    threading.Thread(target=fixed_favorites_latency_guard, daemon=True).start()
+    threading.Thread(target=active_latency_refresh_guard, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
