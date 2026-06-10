@@ -131,6 +131,7 @@ STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
+MANUAL_BLACKLIST_FILE = DATA_DIR / "manual_blacklist.json"
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -184,6 +185,143 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
+
+def normalize_ip_value(value: Any) -> str:
+    ip = str(value or "").strip()
+    if not ip:
+        return ""
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+        return ip
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, ip)
+        return ip.lower()
+    except OSError:
+        return ""
+
+def node_ip_value(node: dict[str, Any]) -> str:
+    return normalize_ip_value(node.get("ip")) or normalize_ip_value(node.get("remote_host"))
+
+def load_manual_blacklist() -> dict[str, dict[str, Any]]:
+    raw = read_json(MANUAL_BLACKLIST_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, Any]] = {}
+    changed = False
+    for key, entry in raw.items():
+        ip = normalize_ip_value(key)
+        if not ip and isinstance(entry, dict):
+            ip = normalize_ip_value(entry.get("ip"))
+        if not ip:
+            changed = True
+            continue
+        if not isinstance(entry, dict):
+            entry = {"ip": ip}
+            changed = True
+        entry["ip"] = ip
+        entry.setdefault("reason", "manual blacklist")
+        entry.setdefault("added_at", time.time())
+        cleaned[ip] = entry
+    if changed:
+        write_json(MANUAL_BLACKLIST_FILE, cleaned)
+    return cleaned
+
+def save_manual_blacklist(data: dict[str, dict[str, Any]]) -> None:
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, entry in data.items():
+        ip = normalize_ip_value(key)
+        if not ip:
+            continue
+        entry = entry if isinstance(entry, dict) else {}
+        normalized[ip] = {
+            "ip": ip,
+            "reason": str(entry.get("reason") or "manual blacklist"),
+            "added_at": float(entry.get("added_at", time.time()) or time.time()),
+        }
+    write_json(MANUAL_BLACKLIST_FILE, normalized)
+
+def manual_blacklist_entries(search: str = "") -> list[dict[str, Any]]:
+    query = normalize_ip_value(search) or str(search or "").strip()
+    entries = list(load_manual_blacklist().values())
+    if query:
+        entries = [entry for entry in entries if query in str(entry.get("ip", ""))]
+    return sorted(entries, key=lambda item: str(item.get("ip", "")))
+
+def apply_manual_blacklist_to_node(node: dict[str, Any], manual: dict[str, dict[str, Any]] | None = None) -> bool:
+    manual = manual if manual is not None else load_manual_blacklist()
+    ip = node_ip_value(node)
+    if ip and ip in manual:
+        node["manual_blacklisted"] = True
+        node["probe_status"] = "unavailable"
+        node["probe_message"] = f"Manual blacklist: {ip}"
+        node["blacklisted_ip"] = ip
+        return True
+    node["manual_blacklisted"] = False
+    node.pop("blacklisted_ip", None)
+    return False
+
+def apply_manual_blacklist_to_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    manual = load_manual_blacklist()
+    for node in nodes:
+        apply_manual_blacklist_to_node(node, manual)
+    return nodes
+
+def apply_manual_blacklist_to_storage() -> None:
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        if not isinstance(nodes, list):
+            return
+        manual = load_manual_blacklist()
+        changed = False
+        for node in nodes:
+            if isinstance(node, dict) and apply_manual_blacklist_to_node(node, manual):
+                changed = True
+        if changed:
+            write_json(NODES_FILE, nodes)
+
+def add_manual_blacklist_ip(ip: str, reason: str = "manual blacklist") -> dict[str, Any]:
+    normalized = normalize_ip_value(ip)
+    if not normalized:
+        raise ValueError("请输入有效 IP")
+    data = load_manual_blacklist()
+    data[normalized] = {
+        "ip": normalized,
+        "reason": reason or "manual blacklist",
+        "added_at": time.time(),
+    }
+    save_manual_blacklist(data)
+    apply_manual_blacklist_to_storage()
+    cleanup_favorite_node_ids()
+    disconnect_active_if_manual_blacklisted(normalized)
+    return data[normalized]
+
+def remove_manual_blacklist_ip(ip: str) -> bool:
+    normalized = normalize_ip_value(ip)
+    if not normalized:
+        raise ValueError("请输入有效 IP")
+    data = load_manual_blacklist()
+    existed = normalized in data
+    if existed:
+        data.pop(normalized, None)
+        save_manual_blacklist(data)
+    return existed
+
+def disconnect_active_if_manual_blacklisted(ip: str) -> None:
+    global active_openvpn_node_id
+    if not ip or not active_openvpn_node_id:
+        return
+    nodes = read_json(NODES_FILE, [])
+    if not isinstance(nodes, list):
+        return
+    active_node = next((node for node in nodes if isinstance(node, dict) and node.get("id") == active_openvpn_node_id), None)
+    if active_node and node_ip_value(active_node) == ip:
+        stop_active_openvpn()
+        active_node["active"] = False
+        apply_manual_blacklist_to_node(active_node)
+        write_json(NODES_FILE, nodes)
+        set_state(active_openvpn_node_id="", active_node_latency="无活动连接", last_check_message=f"手动拉黑当前节点 IP: {ip}")
 
 import hashlib
 import random
@@ -349,7 +487,7 @@ def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
     if not isinstance(raw, list):
         return []
-    return [item for item in raw if isinstance(item, dict)]
+    return apply_manual_blacklist_to_nodes([item for item in raw if isinstance(item, dict)])
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
@@ -366,9 +504,15 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
+    state["manual_blacklisted_nodes"] = len(load_manual_blacklist())
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
+    try:
+        cleanup_favorite_node_ids()
+        ui_cfg = load_ui_config()
+    except Exception:
+        pass
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
@@ -786,6 +930,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
                     try:
                         config_text = decode_config(encoded)
                         node = row_to_node(row, config_text)
+                        apply_manual_blacklist_to_node(node)
                     except Exception as row_exc:
                         print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
                         log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
@@ -1332,6 +1477,31 @@ def active_node_real_latency(node_id: str) -> dict[str, Any] | None:
 
 def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
     node_id = str(node_info.get("id") or "")
+    manual = load_manual_blacklist()
+    if apply_manual_blacklist_to_node(node_info, manual):
+        result = {
+            "id": node_id,
+            "ip": node_info.get("ip") or node_info.get("remote_host") or "",
+            "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
+            "remote_port": parse_int(node_info.get("remote_port")),
+            "host_name": node_info.get("host_name", ""),
+            "sessions": node_info.get("sessions", 0),
+            "latency_ms": parse_int(node_info.get("latency_ms")),
+            "probe_status": "unavailable",
+            "probe_message": node_info.get("probe_message") or "Manual blacklist",
+            "probed_at": time.time(),
+            "owner": node_info.get("owner", ""),
+            "asn": node_info.get("asn", ""),
+            "as_name": node_info.get("as_name", ""),
+            "location": node_info.get("location", ""),
+            "ip_type": node_info.get("ip_type", ""),
+            "quality": node_info.get("quality", ""),
+            "manual_blacklisted": True,
+            "blacklisted_ip": node_info.get("blacklisted_ip", ""),
+        }
+        mark_purity_disabled(result)
+        return result
+
     active_result = active_node_real_latency(node_id)
     if active_result is not None:
         latency = parse_int(active_result.get("latency_ms"))
@@ -1463,8 +1633,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
             node.update({k: v for k, v in tested.items() if k != "id"})
+            apply_manual_blacklist_to_node(node)
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
+            cleanup_favorite_node_ids(sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
             return res
         else:
@@ -1513,16 +1685,20 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     with lock:
         current_nodes = read_nodes()
+        manual = load_manual_blacklist()
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
+            apply_manual_blacklist_to_node(n, manual)
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
+        cleanup_favorite_node_ids(sorted_nodes)
         
     return list(updated_nodes_map.values())
 
 fixed_region_failover_lock = threading.Lock()
+fixed_favorites_failover_lock = threading.Lock()
 
 def country_matches(node: dict[str, Any], target_country: str) -> bool:
     if not target_country:
@@ -1542,12 +1718,12 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
 
     if routing_mode == "fixed_region" and target_country:
         candidates = [n for n in candidates if country_matches(n, target_country)]
-    elif routing_mode == "favorites":
+    elif routing_mode in ("favorites", "fixed_favorites"):
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
         if fav_candidates:
             candidates = fav_candidates
-        elif not ui_cfg.get("fav_fail_fallback", True):
+        elif routing_mode == "fixed_favorites" or not ui_cfg.get("fav_fail_fallback", True):
             candidates = []
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
@@ -1558,6 +1734,43 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
 
     candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
     return candidates
+
+def favorite_node_ids(ui_cfg: dict[str, Any]) -> list[str]:
+    fav_ids = ui_cfg.get("favorite_node_ids", [])
+    if not isinstance(fav_ids, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in fav_ids:
+        node_id = str(item or "").strip()
+        if node_id and node_id not in seen:
+            result.append(node_id)
+            seen.add(node_id)
+    return result
+
+def node_can_be_favorited(node: dict[str, Any] | None) -> bool:
+    if not node:
+        return False
+    if node.get("manual_blacklisted"):
+        return False
+    return node.get("probe_status") == "available"
+
+def cleanup_favorite_node_ids(nodes: list[dict[str, Any]] | None = None) -> list[str]:
+    ui_cfg = load_ui_config()
+    fav_ids = favorite_node_ids(ui_cfg)
+    if not fav_ids:
+        return []
+    if nodes is None:
+        nodes = read_nodes()
+    node_map = {str(n.get("id") or ""): n for n in nodes if isinstance(n, dict)}
+    cleaned = [node_id for node_id in fav_ids if node_can_be_favorited(node_map.get(node_id))]
+    if cleaned != fav_ids:
+        ui_cfg["favorite_node_ids"] = cleaned
+        auth_file = DATA_DIR / "ui_auth.json"
+        with lock:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return cleaned
 
 def refresh_and_switch_fixed_region(reason: str) -> None:
     if not fixed_region_failover_lock.acquire(blocking=False):
@@ -1590,6 +1803,55 @@ def refresh_and_switch_fixed_region(reason: str) -> None:
         log_to_json("ERROR", "VPN", f"固定地区刷新切换失败: {exc}")
     finally:
         fixed_region_failover_lock.release()
+
+def refresh_and_switch_fixed_favorites(reason: str) -> None:
+    if not fixed_favorites_failover_lock.acquire(blocking=False):
+        print(f"[固定收藏切换] 已有固定收藏刷新切换任务运行中，跳过本次触发: {reason}", flush=True)
+        return
+    try:
+        ui_cfg = load_ui_config()
+        if ui_cfg.get("routing_mode") != "fixed_favorites":
+            return
+        if not ui_cfg.get("connection_enabled", True):
+            return
+
+        fav_ids = favorite_node_ids(ui_cfg)
+        if not fav_ids:
+            set_state(last_check_message="固定收藏菜单模式没有收藏节点，无法自动切换")
+            return
+
+        msg = f"固定收藏菜单模式触发收藏节点测速排序并切换到最低延迟节点。原因: {reason}"
+        print(f"[固定收藏切换] {msg}", flush=True)
+        log_to_json("INFO", "VPN", msg)
+
+        with lock:
+            nodes = read_nodes()
+            existing_fav_ids = [n["id"] for n in nodes if n.get("id") in fav_ids]
+
+        if existing_fav_ids:
+            test_multiple_nodes(existing_fav_ids)
+
+        with lock:
+            nodes = read_nodes()
+            cleanup_favorite_node_ids(nodes)
+            ui_cfg = load_ui_config()
+            candidates = filter_routing_candidates(nodes, ui_cfg, exclude_active=False)
+
+        if not candidates:
+            set_state(last_check_message="固定收藏菜单模式没有可用收藏节点，无法自动切换")
+            return
+
+        next_node = candidates[0]
+        if next_node.get("id") == active_openvpn_node_id and active_openvpn_running():
+            set_state(last_check_message=f"固定收藏菜单已完成测速排序，当前活动节点已是最低延迟收藏节点: {next_node.get('id')}")
+            return
+
+        connect_node(next_node["id"])
+    except Exception as exc:
+        print(f"[固定收藏切换] 收藏节点测速排序并切换失败: {exc}", flush=True)
+        log_to_json("ERROR", "VPN", f"固定收藏刷新切换失败: {exc}")
+    finally:
+        fixed_favorites_failover_lock.release()
 
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
@@ -1669,6 +1931,9 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+        if apply_manual_blacklist_to_node(node):
+            write_json(NODES_FILE, nodes)
+            raise RuntimeError(f"Node IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('ip') or node.get('remote_host')}")
         
         ui_cfg = load_ui_config()
         ui_cfg["connection_enabled"] = True
@@ -1815,6 +2080,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                                 args=(f"活动节点代理不可用: {error_msg}",),
                                 daemon=True,
                             ).start()
+                        elif routing_mode == "fixed_favorites":
+                            threading.Thread(
+                                target=refresh_and_switch_fixed_favorites,
+                                args=(f"活动节点代理不可用: {error_msg}",),
+                                daemon=True,
+                            ).start()
                         else:
                             auto_switch_node()
                         is_connecting = True
@@ -1911,7 +2182,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if routing_mode != "fixed_ip":
                         available_candidates = filter_routing_candidates(merged, ui_cfg, exclude_active=True)
                         if available_candidates:
-                            auto_switch_node()
+                            if routing_mode == "fixed_favorites":
+                                threading.Thread(
+                                    target=refresh_and_switch_fixed_favorites,
+                                    args=("维护更新后检测到当前没有活动连接",),
+                                    daemon=True,
+                                ).start()
+                            else:
+                                auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
@@ -2550,140 +2828,6 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 320px;
       margin-bottom: 0 !important;
     }
-    .vps-recommend-tab {
-      position: fixed;
-      right: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 38px;
-      background: var(--primary-gradient);
-      border: 1px solid var(--border-color-hover);
-      border-right: none;
-      border-radius: 8px 0 0 8px;
-      padding: 16px 6px;
-      color: white;
-      font-weight: 700;
-      font-size: 13px;
-      line-height: 1.4;
-      text-align: center;
-      cursor: pointer;
-      z-index: 999;
-      box-shadow: -4px 0 20px rgba(99, 102, 241, 0.3);
-      transition: all 0.3s ease;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-    }
-    .vps-recommend-tab:hover {
-      padding-right: 10px;
-      box-shadow: -4px 0 25px rgba(99, 102, 241, 0.5);
-    }
-
-    .vps-links {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 16px;
-    }
-    
-    @media (max-width: 576px) {
-      .vps-links {
-        grid-template-columns: 1fr;
-      }
-    }
-    
-    .vps-item {
-      background: rgba(255, 255, 255, 0.02);
-      border: 1px solid rgba(255, 255, 255, 0.04);
-      border-radius: 12px;
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      justify-content: space-between;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
-    }
-    
-    .vps-item:hover {
-      background: rgba(255, 255, 255, 0.05);
-      border-color: rgba(99, 102, 241, 0.3);
-      transform: translateY(-2px);
-      box-shadow: 0 8px 30px rgba(99, 102, 241, 0.1);
-    }
-    
-    .vps-tag {
-      font-size: 11px;
-      font-weight: 700;
-      padding: 4px 10px;
-      border-radius: 6px;
-      width: fit-content;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    
-    .tag-normal {
-      background: rgba(99, 102, 241, 0.15);
-      color: #a5b4fc;
-      border: 1px solid rgba(99, 102, 241, 0.2);
-    }
-    
-    .tag-premium {
-      background: rgba(16, 185, 129, 0.15);
-      color: #6ee7b7;
-      border: 1px solid rgba(16, 185, 129, 0.2);
-    }
-    
-    .vps-desc {
-      font-size: 13px;
-      color: var(--text-secondary);
-      line-height: 1.6;
-      flex: 1;
-    }
-    
-    .vps-btn {
-      align-self: stretch;
-      text-decoration: none;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      color: var(--text-primary);
-      font-size: 12px;
-      font-weight: 600;
-      padding: 8px 16px;
-      border-radius: 8px;
-      transition: all 0.2s ease;
-      text-align: center;
-    }
-    
-    .vps-item:hover .vps-btn {
-      background: var(--primary-gradient);
-      border-color: transparent;
-      color: white;
-      box-shadow: 0 4px 10px rgba(99, 102, 241, 0.2);
-    }
-    
-    .vps-footer {
-      border-top: 1px dashed rgba(255, 255, 255, 0.08);
-      padding-top: 12px;
-      font-size: 13px;
-      color: var(--text-secondary);
-      text-align: center;
-    }
-    
-    .forum-link {
-      color: #818cf8;
-      font-weight: 700;
-      text-decoration: none;
-      transition: color 0.2s ease;
-    }
-    
-    .forum-link:hover {
-      color: #a5b4fc;
-      text-decoration: underline;
-    }
-
     .toolbar {
       background: var(--bg-surface);
       backdrop-filter: blur(12px);
@@ -2859,6 +3003,7 @@ INDEX_HTML = r"""<!doctype html>
     .table-actions {
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
     }
 
     .connect-btn {
@@ -3081,9 +3226,15 @@ INDEX_HTML = r"""<!doctype html>
     /* Option Card Styles for Proxy/Routing Settings */
     .option-group {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 10px;
       margin-top: 6px;
+    }
+    
+    @media (max-width: 640px) {
+      .option-group {
+        grid-template-columns: repeat(2, 1fr);
+      }
     }
     
     @media (max-width: 480px) {
@@ -3220,6 +3371,12 @@ INDEX_HTML = r"""<!doctype html>
       </svg>
       收藏菜单
     </button>
+    <button id="btn_blacklist" class="toolbar-btn" type="button" onclick="toggleBlacklistView()" style="height: 42px; gap: 6px;">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M18.364 5.636l-12.728 12.728M12 3a9 9 0 110 18 9 9 0 010-18z" />
+      </svg>
+      拉黑菜单
+    </button>
   </section>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
@@ -3254,6 +3411,25 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div id="blacklist_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <span style="font-size: 15px; font-weight: 600; color: var(--text-primary);">⛔ 拉黑 IP 管理</span>
+          <span style="font-size: 13px; color: var(--text-secondary);">被拉黑 IP 的节点会始终显示不可用，检测或更新节点都不会改回可用。</span>
+        </div>
+        <button id="btn_blacklist_back" class="toolbar-btn" type="button" onclick="resetBlacklistSearch()" style="display:none; height:36px;">返回</button>
+      </div>
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+        <input id="blacklist_ip_input" class="input-field" style="max-width: 280px;" placeholder="输入要搜索或添加的 IP" />
+        <button class="toolbar-btn" type="button" onclick="searchBlacklistIp()" style="height: 40px;">搜索</button>
+        <button class="toolbar-btn" type="button" onclick="addBlacklistIp()" style="height: 40px; color: var(--danger); border-color: rgba(244,63,94,0.35);">添加</button>
+      </div>
+      <div id="blacklist_msg" style="display:none; color: var(--danger); font-size: 13px; font-weight: 600;"></div>
+      <div id="blacklist_list" style="display: flex; flex-direction: column; gap: 10px;"></div>
+    </div>
+  </div>
+
   <div class="table-wrapper">
     <div class="table-container">
       <table>
@@ -3264,7 +3440,7 @@ INDEX_HTML = r"""<!doctype html>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">IP 类型</th>
-            <th style="width: 180px;">操作</th>
+            <th style="width: 260px;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -3372,6 +3548,10 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-title">固定地区</div>
                 <div class="option-card-desc">锁定特定国家地区</div>
               </div>
+              <div class="option-card" data-value="fixed_favorites" onclick="setRoutingMode('fixed_favorites')">
+                <div class="option-card-title">固定收藏菜单</div>
+                <div class="option-card-desc">只切换收藏最低延迟</div>
+              </div>
             </div>
           </div>
           
@@ -3413,52 +3593,6 @@ INDEX_HTML = r"""<!doctype html>
       </form>
     </div>
   </div>
-
-
-  <!-- VPS 购买推荐 Modal -->
-  <div id="vps_recommend_modal" class="modal">
-    <div class="modal-content" style="max-width: 640px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--warning);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364.364l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
-          VPS 购买推荐
-        </h3>
-        <button type="button" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-      
-      <div class="vps-links">
-        <div class="vps-item">
-          <span class="vps-tag tag-normal">RNVPS (RackNerd) 推荐</span>
-          <span class="vps-desc">超低折扣价格，性价比极高，日常使用实惠方便，海外多机房可选，非常适合普通大众用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="vps-btn">点击进入官网</a>
-        </div>
-        <div class="vps-item">
-          <span class="vps-tag tag-premium">搬瓦工 (Bandwagon) 推荐</span>
-          <span class="vps-desc">直连三网顶级专线，经典高带宽 CN2 GIA/9929 优化线路，极致速度且超凡稳定，高端用户首选。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="vps-btn">点击进入官网</a>
-        </div>
-      </div>
-      
-      <div class="vps-footer" style="margin-top: 20px;">
-        官方技术支持及优质资源交流论坛：<a href="https://339936.xyz" target="_blank" class="forum-link">339936.xyz</a>
-      </div>
-
-      <div class="vps-footer" style="margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px; text-align: left; font-size: 13px; color: var(--text-secondary); line-height: 1.6;">
-        <div style="font-weight: bold; color: var(--text-primary); margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          🎁 捐赠支持项目开发：
-        </div>
-        <div style="font-family: monospace; background: rgba(0,0,0,0.2); padding: 8px 12px; border-radius: 6px; margin-top: 6px; word-break: break-all; select-all: true;">
-          <span style="color: var(--primary); font-weight: bold;">BNB (BSC):</span> 0xB6d78c42CEB0687A31B8cfEBE4b51b6eB8953C17<br>
-          <span style="color: var(--primary); font-weight: bold;">TRX (TRC20):</span> TSdzCW6JvsrqcppodYjhSrku4mYmDJ9pxf
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="vps-recommend-tab" onclick="openVpsModal()">VPS购买推荐</div>
 
   <!-- Gateway Modal (网关自检与代理测试) -->
   <div id="gateway_modal" class="modal">
@@ -3572,6 +3706,10 @@ let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 99999;
 let currentPageNodes = [];
+let showBlacklistPanel = false;
+let blacklistItems = [];
+let blacklistSearchActive = false;
+let blacklistMsgTimer = null;
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -3772,7 +3910,7 @@ function render(){
         <th>运营主体 / ISP</th>
         <th style="width: 92px;">网络质量</th>
         <th style="width: 92px;">IP 类型</th>
-        <th style="width: 202px;">操作</th>
+        <th style="width: 260px;">操作</th>
       </tr>`;
     tableHead.dataset.extended = "1";
   }
@@ -3912,6 +4050,7 @@ function render(){
   }
 
   updateFavPanelUI();
+  renderBlacklistPanel();
 
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
@@ -3928,11 +4067,12 @@ function render(){
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
-      const isCurrentlyActive = activeNode && n.id === activeNode.id;
+      const isManualBlacklisted = !!n.manual_blacklisted;
+      const isCurrentlyActive = activeNode && n.id === activeNode.id && !isManualBlacklisted;
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       
-      const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
-      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status);
+      const badgeClass = isManualBlacklisted ? 'unavailable' : (isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked'));
+      const badgeText = isManualBlacklisted ? '不可用' : (isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status));
       const displayLatency = displayLatencyForNode(n, activeNodeId);
       const latencyClass = getLatencyClass(displayLatency);
       const latencyText = displayLatency ? `<span class="latency-val ${latencyClass}">${displayLatency} ms</span>` : "-";
@@ -3948,16 +4088,23 @@ function render(){
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
-      const isUnavailable = n.probe_status === "unavailable";
+      const isUnavailable = isManualBlacklisted || n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
-      const favBtn = isFav 
+      const favoriteDisabled = isManualBlacklisted || n.probe_status !== "available";
+      const favBtn = favoriteDisabled
+        ? `<button class="test-btn" disabled style="color: var(--text-secondary); border-color: var(--border-color); opacity: 0.45; padding: 0 8px; height: 30px; cursor:not-allowed;">☆ 不可收藏</button>`
+        : (isFav 
         ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
-        : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
+        : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`);
+
+      const blacklistBtn = n.manual_blacklisted
+        ? `<button class="test-btn" disabled style="color: var(--danger); border-color: rgba(244,63,94,0.4); opacity: 0.8; padding: 0 8px; height: 30px;">已拉黑</button>`
+        : `<button class="test-btn" style="color: var(--danger); border-color: rgba(244,63,94,0.35); padding: 0 8px; height: 30px;" onclick="blacklistNode('${esc(n.ip||n.remote_host)}', event)">拉黑</button>`;
 
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -3972,6 +4119,7 @@ function render(){
         <td>
           <div class="table-actions">
             ${testBtn}
+            ${blacklistBtn}
             ${favBtn}
             ${connectBtn}
           </div>
@@ -4024,6 +4172,9 @@ async function testNode(btn, id, event){
       const idx = nodes.findIndex(n => n && n.id === id);
       if (idx !== -1) {
         nodes[idx] = result.node;
+        if (result.node.probe_status !== "available" || result.node.manual_blacklisted) {
+          state.favorite_node_ids = (Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : []).filter(x => x !== id);
+        }
         stableSortNodes();
       }
     }
@@ -4046,9 +4197,37 @@ async function toggleFavorite(id, event) {
     if (result.ok) {
       state.favorite_node_ids = Array.isArray(result.favorite_node_ids) ? result.favorite_node_ids : [];
       render();
+    } else {
+      showBlacklistMessage(result.error || "该节点当前不能收藏");
+      await load();
     }
   } catch (e) {
     console.error("切换收藏失败", e);
+  }
+}
+
+async function blacklistNode(ip, event) {
+  if (event) event.stopPropagation();
+  const targetIp = String(ip || "").trim();
+  if (!targetIp) {
+    showBlacklistMessage("无法识别节点IP");
+    return;
+  }
+  try {
+    const response = await fetch("./api/manual_blacklist_add", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ip: targetIp})
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      showBlacklistMessage(result.error || "拉黑失败");
+      return;
+    }
+    blacklistItems = Array.isArray(result.items) ? result.items : [];
+    await load();
+  } catch(e) {
+    showBlacklistMessage("拉黑失败");
   }
 }
 
@@ -4141,11 +4320,27 @@ async function disconnectNode(){
 
 
 
+async function loadManualBlacklist(search = "") {
+  const url = search ? `./api/manual_blacklist?search=${encodeURIComponent(search)}` : "./api/manual_blacklist";
+  const response = await fetch(url);
+  const data = await response.json();
+  if (data.ok) {
+    blacklistItems = Array.isArray(data.items) ? data.items : [];
+    blacklistSearchActive = !!search;
+    if (data.not_found) {
+      showBlacklistMessage("没有这个IP");
+    }
+  }
+}
+
 async function load(){
   const r=await fetch("./api/nodes"); 
   const d=await r.json(); 
   nodes=Array.isArray(d.nodes) ? d.nodes : []; 
   state=d.state||{}; 
+  if (showBlacklistPanel) {
+    try { await loadManualBlacklist(blacklistSearchActive ? ($("blacklist_ip_input")?.value || "") : ""); } catch(e) {}
+  }
   
   stableSortNodes();
   updateCountryFilter();
@@ -4240,8 +4435,134 @@ document.addEventListener("click", () => {
 
 let showFavoritesOnly = false;
 
+function showBlacklistMessage(msg) {
+  const el = $("blacklist_msg");
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = "block";
+  if (blacklistMsgTimer) clearTimeout(blacklistMsgTimer);
+  blacklistMsgTimer = setTimeout(() => {
+    el.style.display = "none";
+  }, 2200);
+}
+
+async function toggleBlacklistView() {
+  showBlacklistPanel = !showBlacklistPanel;
+  if (showBlacklistPanel) {
+    showFavoritesOnly = false;
+    blacklistSearchActive = false;
+    if ($("blacklist_ip_input")) $("blacklist_ip_input").value = "";
+    try { await loadManualBlacklist(); } catch(e) { showBlacklistMessage("加载拉黑列表失败"); }
+  }
+  currentPage = 1;
+  render();
+}
+
+function renderBlacklistPanel() {
+  const panel = $("blacklist_panel");
+  if (!panel) return;
+  panel.style.display = showBlacklistPanel ? "block" : "none";
+
+  const btn = $("btn_blacklist");
+  if (btn) {
+    if (showBlacklistPanel) btn.classList.add("active");
+    else btn.classList.remove("active");
+  }
+
+  const backBtn = $("btn_blacklist_back");
+  if (backBtn) backBtn.style.display = blacklistSearchActive ? "inline-flex" : "none";
+
+  const list = $("blacklist_list");
+  if (!list) return;
+  if (!blacklistItems.length) {
+    if (blacklistSearchActive) {
+      list.innerHTML = "";
+      return;
+    }
+    list.innerHTML = `<div style="padding: 24px; text-align:center; color: var(--text-secondary); border: 1px dashed var(--border-color); border-radius: 10px;">没有拉黑 IP</div>`;
+    return;
+  }
+  list.innerHTML = blacklistItems.map(item => {
+    const ip = item.ip || "";
+    return `<div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border:1px solid var(--border-color); border-radius:10px; background:rgba(255,255,255,0.03);">
+      <div style="display:flex; flex-direction:column; gap:4px;">
+        <span class="mono" style="font-size:14px; color:var(--text-primary);">${esc(ip)}</span>
+        <span style="font-size:12px; color:var(--text-secondary);">添加时间：${time(item.added_at)}</span>
+      </div>
+      <button class="test-btn" style="color: var(--success); border-color: rgba(16,185,129,0.35); padding: 0 10px; height: 30px;" onclick="removeBlacklistIp('${esc(ip)}', event)">取消拉黑</button>
+    </div>`;
+  }).join("");
+}
+
+async function searchBlacklistIp() {
+  const input = $("blacklist_ip_input");
+  const ip = input ? input.value.trim() : "";
+  if (!ip) {
+    blacklistSearchActive = false;
+    await loadManualBlacklist();
+  } else {
+    await loadManualBlacklist(ip);
+  }
+  renderBlacklistPanel();
+}
+
+async function resetBlacklistSearch() {
+  blacklistSearchActive = false;
+  if ($("blacklist_ip_input")) $("blacklist_ip_input").value = "";
+  await loadManualBlacklist();
+  renderBlacklistPanel();
+}
+
+async function addBlacklistIp() {
+  const input = $("blacklist_ip_input");
+  const ip = input ? input.value.trim() : "";
+  if (!ip) {
+    showBlacklistMessage("请输入IP");
+    return;
+  }
+  try {
+    const response = await fetch("./api/manual_blacklist_add", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ip})
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      showBlacklistMessage(result.error || "添加失败");
+      return;
+    }
+    blacklistSearchActive = false;
+    if (input) input.value = "";
+    blacklistItems = Array.isArray(result.items) ? result.items : [];
+    await load();
+  } catch(e) {
+    showBlacklistMessage("添加失败");
+  }
+}
+
+async function removeBlacklistIp(ip, event) {
+  if (event) event.stopPropagation();
+  try {
+    const response = await fetch("./api/manual_blacklist_remove", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ip})
+    });
+    const result = await response.json();
+    if (!result.ok) {
+      showBlacklistMessage(result.error || "取消失败");
+      return;
+    }
+    blacklistItems = Array.isArray(result.items) ? result.items : [];
+    await load();
+  } catch(e) {
+    showBlacklistMessage("取消失败");
+  }
+}
+
 function toggleFavoritesView() {
   showFavoritesOnly = !showFavoritesOnly;
+  if (showFavoritesOnly) showBlacklistPanel = false;
   currentPage = 1;
   render();
 }
@@ -4273,7 +4594,7 @@ function updateFavPanelUI() {
 
     const favRoutingBtn = $("btn_toggle_fav_routing");
     if (favRoutingBtn) {
-      if (state.routing_mode === "favorites") {
+      if (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") {
         favRoutingBtn.textContent = "禁用仅用收藏出站";
         favRoutingBtn.style.background = "var(--danger-gradient)";
         favRoutingBtn.style.borderColor = "transparent";
@@ -4292,7 +4613,7 @@ function updateFavPanelUI() {
 
 async function toggleFavRouting() {
   if (!state) return;
-  const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
+  const newMode = (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") ? "auto" : "favorites";
   
   state.routing_mode = newMode;
   updateFavPanelUI();
@@ -4409,6 +4730,12 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
     warningDiv.innerHTML = `⚠️ <strong>仅用收藏</strong>：只连接和切换您收藏的节点。如果所有收藏的节点均失效，系统不会自动切换到未收藏的节点。请确保收藏列表中有足够多且可用的节点。`;
+  } else if (mode === "fixed_favorites") {
+    countryGroup.style.display = "none";
+    warningDiv.style.color = "var(--warning)";
+    warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
+    warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
+    warningDiv.innerHTML = `⚠️ <strong>固定收藏菜单</strong>：只在收藏节点范围内测速排序，并切换到延迟最低的收藏节点。后台每 30 分钟检测当前活动节点，延迟超过 1000ms 时会标记不可用并重新在收藏节点中选择最低延迟节点。`;
   } else if (mode === "fixed_ip") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -4662,15 +4989,6 @@ async function saveNetwork(e) {
   }
 }
 
-
-
-function openVpsModal() {
-  $("vps_recommend_modal").style.display = "flex";
-}
-
-function closeVpsModal() {
-  $("vps_recommend_modal").style.display = "none";
-}
 
 async function logoutAdmin() {
   try {
@@ -5049,7 +5367,21 @@ def background_proxy_checker() -> None:
                                 mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
                                 active_node["probe_status"] = "unavailable"
                                 write_json(NODES_FILE, nodes)
-                        auto_switch_node()
+                                cleanup_favorite_node_ids(nodes)
+                        if routing_mode == "fixed_region":
+                            threading.Thread(
+                                target=refresh_and_switch_fixed_region,
+                                args=(f"代理连通性检测失败: {error_msg}",),
+                                daemon=True,
+                            ).start()
+                        elif routing_mode == "fixed_favorites":
+                            threading.Thread(
+                                target=refresh_and_switch_fixed_favorites,
+                                args=(f"代理连通性检测失败: {error_msg}",),
+                                daemon=True,
+                            ).start()
+                        else:
+                            auto_switch_node()
                     else:
                         print(f"[代理守护线程] 固定 IP 模式下代理不可用，正在尝试重启连接同一节点: {active_openvpn_node_id}", flush=True)
                         is_connecting = False
@@ -5125,11 +5457,52 @@ def fixed_region_latency_guard() -> None:
                     active_node["probe_message"] = reason
                     active_node["latency_ms"] = latency
                     write_json(NODES_FILE, sort_all_nodes(nodes))
+                    cleanup_favorite_node_ids(nodes)
 
             refresh_and_switch_fixed_region(reason)
         except Exception as exc:
             print(f"[固定地区延迟巡检] 执行异常: {exc}", flush=True)
             log_to_json("ERROR", "VPN", f"固定地区延迟巡检异常: {exc}")
+
+def fixed_favorites_latency_guard() -> None:
+    time.sleep(60)
+    while True:
+        try:
+            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
+            ui_cfg = load_ui_config()
+            if ui_cfg.get("routing_mode") != "fixed_favorites":
+                continue
+            if not ui_cfg.get("connection_enabled", True):
+                continue
+            if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
+                continue
+
+            result = check_proxy_health()
+            if not result.get("ok"):
+                continue
+            latency = parse_int(result.get("latency_ms"))
+            set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
+            if latency <= FIXED_REGION_LATENCY_FAILOVER_MS:
+                continue
+
+            reason = f"固定收藏菜单半小时巡检发现当前节点真实出口延迟 {latency} ms > {FIXED_REGION_LATENCY_FAILOVER_MS} ms"
+            print(f"[固定收藏延迟巡检] {reason}", flush=True)
+            log_to_json("WARNING", "VPN", reason)
+            with lock:
+                nodes = read_nodes()
+                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                if active_node:
+                    mark_blacklisted(active_node, reason)
+                    active_node["probe_status"] = "unavailable"
+                    active_node["probe_message"] = reason
+                    active_node["latency_ms"] = latency
+                    write_json(NODES_FILE, sort_all_nodes(nodes))
+                    cleanup_favorite_node_ids(nodes)
+
+            refresh_and_switch_fixed_favorites(reason)
+        except Exception as exc:
+            print(f"[固定收藏延迟巡检] 执行异常: {exc}", flush=True)
+            log_to_json("ERROR", "VPN", f"固定收藏延迟巡检异常: {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5259,6 +5632,17 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/manual_blacklist":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            search = query.get("search", [""])[0]
+            entries = manual_blacklist_entries(search)
+            self.send_json({
+                "ok": True,
+                "items": entries,
+                "count": len(entries),
+                "search": search,
+                "not_found": bool(search and not entries),
+            })
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -5530,7 +5914,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "代理出站端口范围必须是 1024 至 65535"}, HTTPStatus.BAD_REQUEST)
                     return
                 
-                if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
+                if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites", "fixed_favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -5566,6 +5950,12 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
                     self.send_json({"ok": True, "restart_needed": False, "message": "配置更新成功，已即时生效！"})
+                    if routing_mode == "fixed_favorites" and ui_cfg.get("connection_enabled", True):
+                        threading.Thread(
+                            target=refresh_and_switch_fixed_favorites,
+                            args=("settings switched to fixed_favorites",),
+                            daemon=True,
+                        ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -5578,7 +5968,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 fav_fail_fallback = bool(payload.get("fav_fail_fallback", True))
                 
-                if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
+                if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites", "fixed_favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -5598,6 +5988,12 @@ class Handler(BaseHTTPRequestHandler):
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
                 self.send_json({"ok": True, "message": "出站路由配置更新成功，已即时生效！"})
+                if routing_mode == "fixed_favorites" and ui_cfg.get("connection_enabled", True):
+                    threading.Thread(
+                        target=refresh_and_switch_fixed_favorites,
+                        args=("routing switched to fixed_favorites",),
+                        daemon=True,
+                    ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -5611,10 +6007,19 @@ class Handler(BaseHTTPRequestHandler):
                 fav_ids = ui_cfg.get("favorite_node_ids", [])
                 if not isinstance(fav_ids, list):
                     fav_ids = []
+                fav_ids = favorite_node_ids({"favorite_node_ids": fav_ids})
                 
                 if node_id in fav_ids:
                     fav_ids.remove(node_id)
                 else:
+                    nodes = read_nodes()
+                    node = next((n for n in nodes if n.get("id") == node_id), None)
+                    if not node:
+                        self.send_json({"ok": False, "error": "节点不存在"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if not node_can_be_favorited(node):
+                        self.send_json({"ok": False, "error": "该节点当前不可用或已被拉黑，不能收藏"}, HTTPStatus.BAD_REQUEST)
+                        return
                     fav_ids.append(node_id)
                 
                 ui_cfg["favorite_node_ids"] = fav_ids
@@ -5624,6 +6029,31 @@ class Handler(BaseHTTPRequestHandler):
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
                 self.send_json({"ok": True, "favorite_node_ids": fav_ids})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/manual_blacklist_add":
+            try:
+                payload = self.read_json_body()
+                ip = str(payload.get("ip") or "").strip()
+                reason = str(payload.get("reason") or "manual blacklist").strip()
+                entry = add_manual_blacklist_ip(ip, reason)
+                self.send_json({"ok": True, "entry": entry, "items": manual_blacklist_entries()})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/manual_blacklist_remove":
+            try:
+                payload = self.read_json_body()
+                ip = str(payload.get("ip") or "").strip()
+                existed = remove_manual_blacklist_ip(ip)
+                self.send_json({"ok": True, "removed": existed, "items": manual_blacklist_entries()})
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -5805,6 +6235,7 @@ def main() -> None:
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=fixed_region_latency_guard, daemon=True).start()
+    threading.Thread(target=fixed_favorites_latency_guard, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

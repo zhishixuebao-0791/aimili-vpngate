@@ -282,6 +282,42 @@
 
 - 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
 
+## 2026-06-10 补充：固定收藏菜单路由与收藏限制
+
+### 调整目标
+
+- 在代理设置的“IP 出站路由模式”中新增“固定收藏菜单”选项。
+- 选中后仅在收藏节点范围内进行真实出口延迟测速排序，并切换到延迟最低的收藏节点。
+- 固定收藏菜单模式每 30 分钟检查当前活动节点真实出口延迟；如果延迟 `>1000ms`，标记当前节点不可用，并重新对收藏节点测速排序后切换最低延迟节点。
+- 被手动拉黑的节点不能收藏。
+- 被检测或更新节点流程标记为不可用的节点不能收藏。
+- 移除页面右侧“VPS购买推荐”浮动入口。
+
+### 已实现
+
+- 新增路由模式 `fixed_favorites`。
+- 新增 `refresh_and_switch_fixed_favorites()`：
+  - 读取收藏节点 ID。
+  - 对当前收藏节点执行 `test_multiple_nodes()` 真实出口测速。
+  - 按现有延迟排序规则选择最低延迟可用收藏节点。
+  - 当前活动节点已经是最低延迟收藏节点时不重复切换。
+- 新增 `fixed_favorites_latency_guard()`：
+  - 每 30 分钟运行一次。
+  - 仅在 `routing_mode=fixed_favorites`、连接开启、当前节点运行时生效。
+  - 延迟 `>1000ms` 时标记当前活动节点不可用，并触发收藏节点测速排序切换。
+- `background_proxy_checker()` 在固定收藏菜单模式下检测到代理不可用时，会触发固定收藏菜单专用切换路径。
+- 保存代理设置或更新路由为固定收藏菜单模式后，会后台触发一次收藏节点测速排序切换。
+- 新增收藏清理逻辑：
+  - `manual_blacklisted=true` 的节点会从收藏列表清理。
+  - `probe_status != available` 的节点会从收藏列表清理。
+  - 后端 `/api/toggle_favorite` 拒绝收藏不可用或拉黑节点。
+  - 前端不可用/拉黑节点的收藏按钮显示为灰色“不可收藏”并禁用。
+- 已移除右侧 `VPS购买推荐` 浮动入口。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
 ### 后续建议
 
 1. 在真实 VPS 环境跑一次节点刷新，观察 `vpngate_data/nodes.json` 中的 `purity_score` 和 `probe_message`。
@@ -387,6 +423,43 @@
 ### 已验证
 
 - 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+
+## 2026-06-10 补充：手动 IP 拉黑功能
+
+### 调整目标
+
+- 节点操作栏在“检测”和“收藏”之间新增“拉黑”按钮。
+- 工具栏“收藏菜单”旁新增“拉黑菜单”。
+- 被手动拉黑的 IP 节点始终标记为 `unavailable`。
+- 被拉黑节点即使后续点击“检测”或点击“更新节点”测速通过，也不会改回可用。
+- 拉黑菜单支持查看、搜索、手动添加 IP、取消拉黑。
+
+### 已实现
+
+- 新增持久化文件 `vpngate_data/manual_blacklist.json`，与原有临时故障黑名单 `blacklist.json` 分离。
+- 后端新增接口：
+  - `GET /api/manual_blacklist`
+  - `POST /api/manual_blacklist_add`
+  - `POST /api/manual_blacklist_remove`
+- `read_nodes()` 会自动套用手动黑名单，把命中的 IP 标记为：
+  - `manual_blacklisted=true`
+  - `probe_status=unavailable`
+  - `probe_message=Manual blacklist: <ip>`
+- 单节点检测、批量更新写回、节点候选抓取、连接入口均会重新套用手动黑名单规则。
+- 如果拉黑当前正在连接的活动节点 IP，会立即断开该节点并标记不可用。
+- 前端拉黑菜单支持：
+  - 输入框
+  - 搜索
+  - 添加
+  - 搜索返回
+  - 取消拉黑
+- 搜索仅在已拉黑 IP 内执行；未命中时短暂显示红字“没有这个IP”，列表区域为空。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+- 本地模拟添加 `1.2.3.4` 后，对应节点状态变为 `unavailable` 且 `manual_blacklisted=true`。
+- 本地模拟取消拉黑后，手动黑名单列表为空。
 
 ## 2026-06-09 补充：真实出口延迟测速方案已实现
 
