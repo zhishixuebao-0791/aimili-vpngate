@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import math
 import os
 import queue
 import re
@@ -110,6 +111,8 @@ CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+NODE_PROBE_TIMEOUT_SECONDS = env_int("NODE_PROBE_TIMEOUT_SECONDS", 5, 1)
+NODE_TIMEOUT_LATENCY_MS = -1
 FIXED_REGION_LATENCY_CHECK_SECONDS = 30 * 60
 FIXED_REGION_LATENCY_FAILOVER_MS = 500
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -1096,12 +1099,12 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         command.append("--route-nopull")
     return command
 
-def stop_process(process: subprocess.Popen[str] | None) -> None:
+def stop_process(process: subprocess.Popen[str] | None, wait_timeout: float = 8) -> None:
     if process is None or process.poll() is not None:
         return
     process.terminate()
     try:
-        process.wait(timeout=8)
+        process.wait(timeout=wait_timeout)
     except subprocess.TimeoutExpired:
         process.kill()
 
@@ -1266,13 +1269,17 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             level = "WARNING"
         log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
+    timed_out = is_probe_timeout_message(message)
     if not ok:
-        err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
-        message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
+        if timed_out:
+            message = f"[错误代码 1002] OpenVPN timeout after {limit}s. (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
+        else:
+            err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
+            message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
     startup_done[0] = True
     should_keep_process = keep_alive if keep_process is None else keep_process
     if not should_keep_process or not ok:
-        stop_process(process)
+        stop_process(process, wait_timeout=1 if timed_out else 8)
         process = None
     return ok, message, process
 
@@ -1409,6 +1416,8 @@ def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep
     kept: list[dict[str, Any]] = []
     for node in nodes:
         node_id = str(node.get("id") or "")
+        if parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS and node_id not in favorite_ids and node_id not in keep_ids:
+            continue
         if (
             node.get("probe_status") == "available"
             or node_id in favorite_ids
@@ -1427,7 +1436,7 @@ def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool
     if not node:
         return False
     latency = parse_int(node.get("latency_ms"))
-    return latency > NODE_LATENCY_LIMIT_MS
+    return latency == NODE_TIMEOUT_LATENCY_MS or latency > NODE_LATENCY_LIMIT_MS
 
 def remove_nodes_by_ids(node_ids: set[str]) -> None:
     if not node_ids:
@@ -1581,7 +1590,7 @@ def build_interface_probe_request(url: str) -> tuple[str, str, str]:
     probe_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
     return probe_url, route_ip, host
 
-def measure_interface_egress_latency(dev: str, timeout: int = 8) -> dict[str, Any]:
+def measure_interface_egress_latency(dev: str, timeout: int = 8, deadline: float | None = None) -> dict[str, Any]:
     targets = [
         ("http://cp.cloudflare.com/generate_204", False),
         ("http://api.ipify.org", True),
@@ -1591,6 +1600,12 @@ def measure_interface_egress_latency(dev: str, timeout: int = 8) -> dict[str, An
     best: dict[str, Any] | None = None
     last_error = ""
     for url, body_is_ip in targets:
+        effective_timeout = timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"ok": False, "latency_ms": NODE_TIMEOUT_LATENCY_MS, "error": f"node probe timeout after {NODE_PROBE_TIMEOUT_SECONDS}s", "via": dev}
+            effective_timeout = max(1, min(timeout, int(math.ceil(remaining))))
         probe_url, route_ip, host_header = build_interface_probe_request(url)
         route_added = add_temporary_probe_route(route_ip, dev)
         cmd = [
@@ -1604,13 +1619,13 @@ def measure_interface_egress_latency(dev: str, timeout: int = 8) -> dict[str, An
             "-w",
             "\n%{time_total} %{http_code}",
             "--max-time",
-            str(timeout),
+            str(effective_timeout),
         ]
         if host_header:
             cmd.extend(["-H", f"Host: {host_header}"])
         cmd.append(probe_url)
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=effective_timeout + 1)
             if res.returncode != 0:
                 last_error = (res.stderr or res.stdout or "").strip()[-180:]
                 continue
@@ -1646,6 +1661,8 @@ def measure_interface_egress_latency(dev: str, timeout: int = 8) -> dict[str, An
                 delete_temporary_probe_route(route_ip, dev)
     if best:
         return best
+    if deadline is not None and time.monotonic() >= deadline:
+        return {"ok": False, "latency_ms": NODE_TIMEOUT_LATENCY_MS, "error": f"node probe timeout after {NODE_PROBE_TIMEOUT_SECONDS}s", "via": dev}
     return {"ok": False, "latency_ms": 0, "error": last_error or f"egress latency probe failed via {dev}", "via": dev}
 
 def active_node_real_latency(node_id: str) -> dict[str, Any] | None:
@@ -1653,8 +1670,36 @@ def active_node_real_latency(node_id: str) -> dict[str, Any] | None:
         return check_proxy_health()
     return None
 
+def is_probe_timeout_message(message: Any) -> bool:
+    text = str(message or "").lower()
+    return any(token in text for token in ("timeout", "timed out", "超时"))
+
+def timeout_probe_result(node_info: dict[str, Any], message: str | None = None) -> dict[str, Any]:
+    result = {
+        "id": str(node_info.get("id") or ""),
+        "ip": node_info.get("ip") or node_info.get("remote_host") or "",
+        "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
+        "remote_port": parse_int(node_info.get("remote_port")),
+        "host_name": node_info.get("host_name", ""),
+        "sessions": node_info.get("sessions", 0),
+        "latency_ms": NODE_TIMEOUT_LATENCY_MS,
+        "probe_status": "unavailable",
+        "probe_message": message or f"Node probe timeout after {NODE_PROBE_TIMEOUT_SECONDS}s",
+        "probed_at": time.time(),
+        "owner": node_info.get("owner", ""),
+        "asn": node_info.get("asn", ""),
+        "as_name": node_info.get("as_name", ""),
+        "location": node_info.get("location", ""),
+        "ip_type": node_info.get("ip_type", ""),
+        "quality": node_info.get("quality", ""),
+        "egress_ip": "",
+    }
+    mark_purity_disabled(result)
+    return result
+
 def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
     node_id = str(node_info.get("id") or "")
+    probe_deadline = time.monotonic() + NODE_PROBE_TIMEOUT_SECONDS
     manual = load_manual_blacklist()
     if apply_manual_blacklist_to_node(node_info, manual):
         result = {
@@ -1683,6 +1728,8 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
     active_result = active_node_real_latency(node_id)
     if active_result is not None:
         latency = parse_int(active_result.get("latency_ms"))
+        if not active_result.get("ok") and is_probe_timeout_message(active_result.get("error")):
+            latency = NODE_TIMEOUT_LATENCY_MS
         ok = bool(active_result.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
         message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms")
         result = {
@@ -1739,27 +1786,36 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
     try:
         tun_idx = get_free_test_index()
         dev_name = f"tun{tun_idx}"
+        remaining = max(1, math.ceil(probe_deadline - time.monotonic()))
         ok, message, process = run_openvpn_until_ready(
             str(temp_path),
             keep_alive=False,
             route_nopull=True,
-            timeout=12,
+            timeout=min(NODE_PROBE_TIMEOUT_SECONDS, remaining),
             dev=dev_name,
             keep_process=True,
         )
+        if not ok and is_probe_timeout_message(message):
+            latency = NODE_TIMEOUT_LATENCY_MS
+        if ok and time.monotonic() >= probe_deadline:
+            ok = False
+            latency = NODE_TIMEOUT_LATENCY_MS
+            message = f"Node probe timeout after {NODE_PROBE_TIMEOUT_SECONDS}s"
         if ok and process is not None:
-            probe = measure_interface_egress_latency(dev_name)
+            probe = measure_interface_egress_latency(dev_name, timeout=NODE_PROBE_TIMEOUT_SECONDS, deadline=probe_deadline)
             latency = parse_int(probe.get("latency_ms"))
             egress_ip = str(probe.get("ip") or "")
             ok = bool(probe.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
             if not probe.get("ok"):
                 message = str(probe.get("error") or "egress latency probe failed")
+                if is_probe_timeout_message(message) or latency == NODE_TIMEOUT_LATENCY_MS:
+                    latency = NODE_TIMEOUT_LATENCY_MS
             elif latency > NODE_LATENCY_LIMIT_MS:
                 message = f"Real egress latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms"
             else:
                 message = f"Real egress latency ok: {latency} ms"
     finally:
-        stop_process(process)
+        stop_process(process, wait_timeout=1 if latency == NODE_TIMEOUT_LATENCY_MS else 8)
         if tun_idx is not None:
             release_test_index(tun_idx)
         try:
@@ -1767,6 +1823,9 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
                 temp_path.unlink()
         except Exception:
             pass
+
+    if latency == NODE_TIMEOUT_LATENCY_MS:
+        return timeout_probe_result(node_info, message)
 
     result = {
         "id": node_id,
@@ -1812,6 +1871,9 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         if node:
             node.update({k: v for k, v in tested.items() if k != "id"})
             apply_manual_blacklist_to_node(node)
+            fav_ids = set(favorite_node_ids(load_ui_config()))
+            if parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS and node_id not in fav_ids:
+                nodes = [item for item in nodes if item.get("id") != node_id]
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             cleanup_favorite_node_ids(sorted_nodes)
@@ -1839,11 +1901,12 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
                 res = future.result()
                 updated_nodes_map[nid] = res
             except Exception as e:
+                timeout_error = isinstance(e, TimeoutError) or is_probe_timeout_message(e)
                 error_node = {
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
-                    "latency_ms": 0
+                    "latency_ms": NODE_TIMEOUT_LATENCY_MS if timeout_error else 0
                 }
                 mark_purity_disabled(error_node)
                 updated_nodes_map[nid] = error_node
@@ -1869,6 +1932,13 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
             if nid in updated_nodes_map:
                 n.update(updated_nodes_map[nid])
             apply_manual_blacklist_to_node(n, manual)
+        if cleanup_favorites:
+            fav_ids = set(favorite_node_ids(load_ui_config()))
+            current_nodes = [
+                n for n in current_nodes
+                if parse_int(n.get("latency_ms")) != NODE_TIMEOUT_LATENCY_MS
+                or str(n.get("id") or "") in fav_ids
+            ]
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
         if cleanup_favorites:
@@ -1902,17 +1972,143 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
         fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
         if fav_candidates:
             candidates = fav_candidates
-        elif routing_mode == "fixed_favorites" or not ui_cfg.get("fav_fail_fallback", True):
+        elif not ui_cfg.get("fav_fail_fallback", True):
             candidates = []
+        else:
+            candidates = [n for n in candidates if n.get("id") not in fav_ids]
 
-    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    if routing_ip_type == "residential":
-        candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
-    elif routing_ip_type == "hosting":
-        candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
+    if routing_mode == "fixed_region":
+        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+        if routing_ip_type == "residential":
+            candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
+        elif routing_ip_type == "hosting":
+            candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
 
     candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
     return candidates
+
+def node_in_routing_test_scope(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+    if node.get("manual_blacklisted"):
+        return False
+    if routing_mode == "auto":
+        return True
+    if routing_mode == "fixed_region":
+        target_country = str(ui_cfg.get("force_country") or "")
+        if target_country and not country_matches(node, target_country):
+            return False
+        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+        if routing_ip_type == "residential":
+            return node.get("ip_type") in ("residential", "mobile")
+        if routing_ip_type == "hosting":
+            return node.get("ip_type") == "hosting"
+        return True
+    if routing_mode in ("favorites", "fixed_favorites"):
+        fav_ids = set(favorite_node_ids(ui_cfg))
+        return str(node.get("id") or "") in fav_ids
+    if routing_mode == "fixed_ip":
+        target_id = str(ui_cfg.get("fixed_node_id") or active_openvpn_node_id or "")
+        return bool(target_id and str(node.get("id") or "") == target_id)
+    return False
+
+def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
+    global active_openvpn_node_id, is_connecting
+    ensure_dirs()
+    if not maintenance_lock.acquire(blocking=False):
+        msg = "路由切换测速排序任务正在运行，跳过本次触发"
+        set_state(last_check_message=msg)
+        return msg
+
+    previous_connecting = is_connecting
+    active_id = active_openvpn_node_id
+    is_connecting = True
+    try:
+        ui_cfg = load_ui_config()
+        routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+        fav_ids = set(favorite_node_ids(ui_cfg))
+        nodes = read_nodes()
+        scope_ids = [
+            str(n.get("id") or "")
+            for n in nodes
+            if str(n.get("id") or "") and node_in_routing_test_scope(n, ui_cfg)
+        ]
+
+        if not scope_ids:
+            msg = f"路由模式切换完成，但当前模式没有可测速节点: {routing_mode}"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        with lock:
+            current_nodes = read_nodes()
+            for node in current_nodes:
+                if str(node.get("id") or "") in scope_ids:
+                    node["probe_status"] = "testing"
+                    node["probe_message"] = f"Testing latency for routing mode switch: {routing_mode}"
+                    node["latency_ms"] = 0
+            write_json(NODES_FILE, sort_all_nodes(current_nodes))
+
+        set_state(is_connecting=True, last_check_message=f"正在按新路由模式测速排序: {reason}")
+        test_multiple_nodes(scope_ids, cleanup_favorites=False)
+
+        with lock:
+            tested_nodes = read_nodes()
+            keep_ids: set[str] = set()
+            if routing_mode == "fixed_ip" and active_id:
+                keep_ids.add(active_id)
+            tested_nodes = [
+                node for node in tested_nodes
+                if not (
+                    str(node.get("id") or "") in scope_ids
+                    and parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS
+                    and str(node.get("id") or "") not in fav_ids
+                    and str(node.get("id") or "") not in keep_ids
+                )
+            ]
+            write_json(NODES_FILE, sort_all_nodes(tested_nodes))
+
+        if routing_mode == "fixed_ip":
+            msg = "固定 IP 模式已完成当前固定节点测速；不自动切换"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        all_nodes = read_nodes()
+        candidates = filter_routing_candidates(all_nodes, ui_cfg, exclude_active=False)
+        favorite_available = any(
+            str(n.get("id") or "") in fav_ids
+            and n.get("probe_status") == "available"
+            and node_passes_current_latency(n)
+            for n in all_nodes
+        )
+        if routing_mode in ("favorites", "fixed_favorites") and not favorite_available and not ui_cfg.get("fav_fail_fallback", True):
+            msg = "收藏节点全部不可用，且已禁用非收藏节点回退；保持当前连接不切换"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        if not candidates:
+            msg = f"路由模式 {routing_mode} 测速完成，但没有符合规则的可用节点"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        next_node = candidates[0]
+        if next_node.get("id") == active_id and active_openvpn_running():
+            msg = f"路由模式 {routing_mode} 测速完成，当前节点已是最低延迟节点: {next_node.get('id')}"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        is_connecting = False
+        connect_node(next_node["id"])
+        msg = f"路由模式 {routing_mode} 测速完成，已切换到最低延迟节点: {next_node['id']}"
+        set_state(last_check_message=msg)
+        return msg
+    except Exception as exc:
+        msg = f"路由模式切换测速失败: {exc}"
+        print(f"[路由切换] {msg}", flush=True)
+        log_to_json("ERROR", "VPN", msg)
+        set_state(last_check_message=msg)
+        raise
+    finally:
+        is_connecting = previous_connecting if active_openvpn_node_id else False
+        maintenance_lock.release()
 
 def favorite_node_ids(ui_cfg: dict[str, Any]) -> list[str]:
     fav_ids = ui_cfg.get("favorite_node_ids", [])
@@ -2106,26 +2302,44 @@ def refresh_test_prune_and_maybe_switch(reason: str) -> str:
 
         with lock:
             tested_nodes = read_nodes()
+            keep_unavailable_active_without_fallback = False
+            if routing_mode in ("favorites", "fixed_favorites") and not ui_cfg.get("fav_fail_fallback", True):
+                favorite_available = any(
+                    str(node.get("id") or "") in fav_ids
+                    and node.get("probe_status") == "available"
+                    and node_passes_current_latency(node)
+                    for node in tested_nodes
+                )
+                keep_unavailable_active_without_fallback = not favorite_available and bool(active_id)
             for node in tested_nodes:
                 if node.get("id") == active_id:
                     node["latency_ms"] = max(parse_int(node.get("latency_ms")), NODE_LATENCY_LIMIT_MS + 1)
-                    if not fixed_ip_mode:
+                    if not fixed_ip_mode and not keep_unavailable_active_without_fallback:
                         node["active"] = False
                         node["probe_status"] = "unavailable"
                         node["probe_message"] = reason
+                    elif keep_unavailable_active_without_fallback:
+                        node["active"] = True
+                        node["probe_status"] = "unavailable"
+                        node["probe_message"] = "全部收藏节点不可用，且已禁用非收藏节点回退；保持当前连接"
                 elif not fixed_ip_mode:
                     node["active"] = False
 
-            if not fixed_ip_mode and active_id:
+            if not fixed_ip_mode and active_id and not keep_unavailable_active_without_fallback:
                 stop_active_openvpn()
                 active_openvpn_node_id = ""
 
-            keep_ids = {active_id} if fixed_ip_mode and active_id else set()
+            keep_ids = {active_id} if (fixed_ip_mode or keep_unavailable_active_without_fallback) and active_id else set()
             pruned = prune_failed_nodes(tested_nodes, fav_ids, keep_ids=keep_ids)
             write_json(NODES_FILE, pruned)
 
         if fixed_ip_mode:
             msg = "固定 IP 模式已完成新旧节点测速与剔除；当前连接不自动切换"
+            set_state(is_connecting=False, last_check_message=msg)
+            return msg
+
+        if keep_unavailable_active_without_fallback:
+            msg = "收藏节点全部不可用，且已禁用非收藏节点回退；保持当前连接不切换"
             set_state(is_connecting=False, last_check_message=msg)
             return msg
 
@@ -3627,18 +3841,16 @@ INDEX_HTML = r"""<!doctype html>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
-        <div style="display: flex; flex-direction: column; gap: 4px;">
+        <div style="display: flex; align-items: flex-start; gap: 12px;">
+          <button class="toolbar-btn" type="button" onclick="returnToAllNodes()" style="height: 34px; padding: 0 12px; font-size: 13px;">← 返回</button>
+          <div style="display: flex; flex-direction: column; gap: 4px;">
           <span style="font-size: 15px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
-            ⭐ 收藏专属管理面板
+            ⭐ 收藏管理面板
           </span>
           <span style="font-size: 13px; color: var(--text-secondary);">
-            在这里管理您的收藏节点过滤，以及设置出站连接漂移策略。
+            在这里管理收藏节点，以及设置收藏节点全部不可用后的回退策略。
           </span>
-        </div>
-        <div style="display: flex; gap: 12px; align-items: center;">
-          <button id="btn_toggle_fav_routing" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="toggleFavRouting()">
-            启用仅用收藏出站
-          </button>
+          </div>
         </div>
       </div>
       
@@ -3646,12 +3858,12 @@ INDEX_HTML = r"""<!doctype html>
         <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; user-select: none;">
           <input type="checkbox" id="fav_fail_fallback_checkbox" style="margin-top: 3px; cursor: pointer;" onchange="handleFavFallbackChange(this.checked)" checked />
           <div style="display: flex; flex-direction: column; gap: 2px;">
-            <span style="font-size: 14px; font-weight: 500; color: var(--text-primary);">收藏节点失效后自动切换其他（非收藏）可用节点</span>
-            <span style="font-size: 12px; color: var(--text-secondary);">勾选此项，当所有收藏节点不可用时，系统将自动使用其他最快的非收藏可用节点，保障网络连接不中断。</span>
+            <span style="font-size: 14px; font-weight: 500; color: var(--text-primary);">全部收藏节点不可用后，自动切换到其他最低延迟可用节点</span>
+            <span style="font-size: 12px; color: var(--text-secondary);">勾选后，当收藏节点全部失效且没有收藏节点可切换时，系统会切换到当前批次中延迟最低的非收藏可用节点。</span>
           </div>
         </label>
         <div id="fav_fallback_warning" style="display: none; margin-top: 12px; padding: 10px 14px; background: rgba(244, 63, 94, 0.1); border: 1px solid rgba(244, 63, 94, 0.25); border-radius: 8px; font-size: 12px; color: var(--danger); line-height: 1.4; animation: modalFadeIn 0.2s ease-out;">
-          ⚠️ <strong>警告</strong>：您已取消勾选此项。如果当前收藏的节点均不可用，系统将<strong>无法切换</strong>到其他可用节点，可能导致网络<strong>彻底断开连接</strong>！
+          ⚠️ <strong>警告</strong>：您已取消勾选此项。如果当前收藏的节点全部不可用，系统将不再切换到非收藏节点，并保持当前连接到的不可用节点。
         </div>
       </div>
     </div>
@@ -3660,11 +3872,13 @@ INDEX_HTML = r"""<!doctype html>
   <div id="blacklist_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
-        <div style="display: flex; flex-direction: column; gap: 4px;">
-          <span style="font-size: 15px; font-weight: 600; color: var(--text-primary);">⛔ 拉黑 IP 管理</span>
-          <span style="font-size: 13px; color: var(--text-secondary);">被拉黑 IP 的节点会始终显示不可用，检测或更新节点都不会改回可用。</span>
+        <div style="display: flex; align-items: flex-start; gap: 12px;">
+          <button id="btn_blacklist_back" class="toolbar-btn" type="button" onclick="returnToAllNodes()" style="height:34px; padding: 0 12px; font-size: 13px;">← 返回</button>
+          <div style="display: flex; flex-direction: column; gap: 4px;">
+            <span style="font-size: 15px; font-weight: 600; color: var(--text-primary);">⛔ 拉黑IP管理面板</span>
+            <span style="font-size: 13px; color: var(--text-secondary);">被拉黑 IP 的节点会始终显示不可用，检测或更新节点都不会改回可用。</span>
+          </div>
         </div>
-        <button id="btn_blacklist_back" class="toolbar-btn" type="button" onclick="resetBlacklistSearch()" style="display:none; height:36px;">返回</button>
       </div>
       <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
         <input id="blacklist_ip_input" class="input-field" style="max-width: 280px;" placeholder="输入要搜索或添加的 IP" />
@@ -4050,6 +4264,7 @@ const translateStatus = s => {
 };
 
 function getLatencyClass(ms) {
+  if (parseInt(ms || 0) < 0) return 'latency-poor';
   if (!ms) return '';
   if (ms < 50) return 'latency-good';
   if (ms < 150) return 'latency-medium';
@@ -4062,6 +4277,19 @@ function displayLatencyForNode(n, activeNodeId) {
     return parseInt(state.proxy_latency_ms || 0) || 0;
   }
   return parseInt(n.latency_ms || 0) || 0;
+}
+
+function latencySortValue(ms) {
+  const val = parseInt(ms || 0) || 0;
+  return val > 0 ? val : 999999;
+}
+
+function latencyCell(ms) {
+  const val = parseInt(ms || 0) || 0;
+  if (val === -1) {
+    return `<span class="latency-val latency-poor">-1</span>`;
+  }
+  return val ? `<span class="latency-val ${getLatencyClass(val)}">${val} ms</span>` : "-";
 }
 
 function riskDisplay(n) {
@@ -4130,8 +4358,8 @@ function stableSortNodes() {
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
     const activeNodeId = state.active_openvpn_node_id;
-    const aLatency = displayLatencyForNode(a, activeNodeId) || 999999;
-    const bLatency = displayLatencyForNode(b, activeNodeId) || 999999;
+    const aLatency = latencySortValue(displayLatencyForNode(a, activeNodeId));
+    const bLatency = latencySortValue(displayLatencyForNode(b, activeNodeId));
     if (aLatency !== bLatency) return aLatency - bLatency;
     if ((a.active ? 0 : 1) !== (b.active ? 0 : 1)) return (a.active ? 0 : 1) - (b.active ? 0 : 1);
     if ((a.probe_status === "available" ? 0 : 1) !== (b.probe_status === "available" ? 0 : 1)) {
@@ -4187,8 +4415,7 @@ function render(){
     `;
   } else if (activeNode) {
     const activeLatency = displayLatencyForNode(activeNode, activeNodeId);
-    const latencyClass = getLatencyClass(activeLatency);
-    const latencyText = activeLatency ? `<span class="latency-val ${latencyClass}">${activeLatency} ms</span>` : "-";
+    const latencyText = latencyCell(activeLatency);
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
     activeCardContainer.innerHTML = `
       <div class="active-card">
@@ -4326,8 +4553,7 @@ function render(){
       const badgeClass = isManualBlacklisted ? 'unavailable' : (isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked'));
       const badgeText = isManualBlacklisted ? '不可用' : (isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status));
       const displayLatency = displayLatencyForNode(n, activeNodeId);
-      const latencyClass = getLatencyClass(displayLatency);
-      const latencyText = displayLatency ? `<span class="latency-val ${latencyClass}">${displayLatency} ms</span>` : "-";
+      const latencyText = latencyCell(displayLatency);
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const displayAsn = n.asn || "-";
       const displayQuality = {"normal": "普通", "proxy": "代理", "datacenter": "机房", "mobile": "移动"}[n.quality] || translateQuality(n.quality);
@@ -4709,6 +4935,18 @@ function showBlacklistMessage(msg) {
   }, 2200);
 }
 
+function returnToAllNodes() {
+  showFavoritesOnly = false;
+  showBlacklistPanel = false;
+  blacklistSearchActive = false;
+  if ($("blacklist_ip_input")) $("blacklist_ip_input").value = "";
+  if ($("status_filter")) $("status_filter").value = "all";
+  if ($("country_filter")) $("country_filter").value = "";
+  if ($("ip_type_filter")) $("ip_type_filter").value = "";
+  currentPage = 1;
+  render();
+}
+
 async function toggleBlacklistView() {
   showBlacklistPanel = !showBlacklistPanel;
   if (showBlacklistPanel) {
@@ -4731,9 +4969,6 @@ function renderBlacklistPanel() {
     if (showBlacklistPanel) btn.classList.add("active");
     else btn.classList.remove("active");
   }
-
-  const backBtn = $("btn_blacklist_back");
-  if (backBtn) backBtn.style.display = blacklistSearchActive ? "inline-flex" : "none";
 
   const list = $("blacklist_list");
   if (!list) return;
@@ -4855,53 +5090,6 @@ function updateFavPanelUI() {
       warningDiv.style.display = state.fav_fail_fallback ? "none" : "block";
     }
 
-    const favRoutingBtn = $("btn_toggle_fav_routing");
-    if (favRoutingBtn) {
-      if (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") {
-        favRoutingBtn.textContent = "禁用仅用收藏出站";
-        favRoutingBtn.style.background = "var(--danger-gradient)";
-        favRoutingBtn.style.borderColor = "transparent";
-        favRoutingBtn.style.color = "#ffffff";
-        favRoutingBtn.style.boxShadow = "0 0 12px rgba(244, 63, 94, 0.3)";
-      } else {
-        favRoutingBtn.textContent = "启用仅用收藏出站";
-        favRoutingBtn.style.background = "rgba(255,255,255,0.03)";
-        favRoutingBtn.style.borderColor = "var(--border-color)";
-        favRoutingBtn.style.color = "var(--text-primary)";
-        favRoutingBtn.style.boxShadow = "none";
-      }
-    }
-  }
-}
-
-async function toggleFavRouting() {
-  if (!state) return;
-  const newMode = (state.routing_mode === "favorites" || state.routing_mode === "fixed_favorites") ? "fixed_ip" : "favorites";
-  
-  state.routing_mode = newMode;
-  updateFavPanelUI();
-  
-  try {
-    const res = await fetch("./api/update_routing", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        routing_mode: newMode,
-        force_country: state.force_country || "",
-        routing_ip_type: state.routing_ip_type || "all",
-        fav_fail_fallback: state.fav_fail_fallback !== false
-      })
-    });
-    const data = await res.json();
-    if (res.ok && data.ok) {
-      load();
-    } else {
-      alert("更新出站路由设置失败: " + (data.error || "未知错误"));
-      load();
-    }
-  } catch (err) {
-    alert("连接服务器失败，请稍后重试");
-    load();
   }
 }
 
@@ -4998,7 +5186,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定收藏菜单</strong>：只在收藏节点范围内测速排序，并切换到延迟最低的收藏节点。后台每 30 分钟检测当前活动节点，延迟超过 1000ms 时会标记不可用并重新在收藏节点中选择最低延迟节点。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定收藏菜单</strong>：只在收藏节点范围内测速排序，并切换到延迟最低的收藏节点。后台每 30 分钟检测当前活动节点，延迟超过 500ms 时会标记不可用并重新在收藏节点中选择最低延迟节点；收藏全部不可用时是否回退到非收藏节点，由收藏管理面板的回退选项决定。`;
   } else if (mode === "fixed_ip") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -5233,6 +5421,8 @@ async function saveNetwork(e) {
       } else {
         successDiv.textContent = "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
+        state.is_connecting = true;
+        startConnectionPolling();
         setTimeout(() => {
           closeNetworkModal();
           load();
@@ -6199,6 +6389,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 
                 ui_cfg = load_ui_config()
+                previous_route = (
+                    ui_cfg.get("routing_mode", "fixed_ip"),
+                    ui_cfg.get("force_country", ""),
+                    ui_cfg.get("routing_ip_type", "all"),
+                    ui_cfg.get("fav_fail_fallback", True),
+                )
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
                 
                 if new_proxy_port_int == ui_cfg.get("port", 8787):
@@ -6227,6 +6423,13 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
                     self.send_json({"ok": True, "restart_needed": False, "message": "配置更新成功，已即时生效！"})
+                    next_route = (routing_mode, force_country, routing_ip_type, ui_cfg.get("fav_fail_fallback", True))
+                    if previous_route != next_route and ui_cfg.get("connection_enabled", True):
+                        threading.Thread(
+                            target=test_current_routing_scope_and_maybe_switch,
+                            args=("proxy settings changed",),
+                            daemon=True,
+                        ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -6247,6 +6450,12 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 
                 ui_cfg = load_ui_config()
+                previous_route = (
+                    ui_cfg.get("routing_mode", "fixed_ip"),
+                    ui_cfg.get("force_country", ""),
+                    ui_cfg.get("routing_ip_type", "all"),
+                    ui_cfg.get("fav_fail_fallback", True),
+                )
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
@@ -6259,6 +6468,13 @@ class Handler(BaseHTTPRequestHandler):
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
                 self.send_json({"ok": True, "message": "出站路由配置更新成功，已即时生效！"})
+                next_route = (routing_mode, force_country, routing_ip_type, fav_fail_fallback)
+                if previous_route != next_route and ui_cfg.get("connection_enabled", True):
+                    threading.Thread(
+                        target=test_current_routing_scope_and_maybe_switch,
+                        args=("routing settings changed",),
+                        daemon=True,
+                    ).start()
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
