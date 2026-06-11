@@ -135,6 +135,10 @@ AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 MANUAL_BLACKLIST_FILE = DATA_DIR / "manual_blacklist.json"
+LOGIN_REFRESH_REQUIRED_FILE = DATA_DIR / "login_refresh_required.json"
+VERSION_NOTICE_FILE = DATA_DIR / "version_notice.json"
+UPDATE_REPO_OWNER = os.environ.get("AIMILI_UPDATE_REPO_OWNER", "zhishixuebao-0791")
+UPDATE_REPO_NAME = os.environ.get("AIMILI_UPDATE_REPO_NAME", "aimili-vpngate")
 
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
@@ -159,6 +163,161 @@ def ensure_dirs() -> None:
             AUTH_FILE.chmod(0o600)
         except OSError:
             pass
+
+def mark_login_refresh_required(reason: str = "manual marker") -> None:
+    ensure_dirs()
+    payload = {"reason": reason, "created_at": time.time()}
+    write_json(LOGIN_REFRESH_REQUIRED_FILE, payload)
+
+def consume_login_refresh_required() -> dict[str, Any] | None:
+    if not LOGIN_REFRESH_REQUIRED_FILE.exists():
+        return None
+    try:
+        payload = read_json(LOGIN_REFRESH_REQUIRED_FILE, {})
+    except Exception:
+        payload = {}
+    try:
+        LOGIN_REFRESH_REQUIRED_FILE.unlink()
+    except OSError:
+        pass
+    return payload if isinstance(payload, dict) else {}
+
+def git_output(args: list[str], timeout: int = 3) -> str:
+    try:
+        res = subprocess.run(
+            ["git", *args],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+def current_git_commit() -> str:
+    return git_output(["rev-parse", "HEAD"])
+
+def current_git_tag() -> str:
+    return git_output(["describe", "--tags", "--exact-match"])
+
+def github_api_get(path: str, timeout: int = 3) -> Any:
+    url = f"https://api.github.com{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "AimiliVPN-Version-Check",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def latest_github_version_ref() -> tuple[str, str, str]:
+    try:
+        release = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest")
+        tag_name = str(release.get("tag_name") or "")
+        if tag_name:
+            commit = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/commits/{urllib.parse.quote(tag_name, safe='')}")
+            sha = str(commit.get("sha") or "")
+            if sha:
+                return tag_name, sha, "release"
+    except Exception:
+        pass
+
+    tags = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/tags?per_page=1")
+    if not isinstance(tags, list) or not tags:
+        return "", "", ""
+    latest = tags[0]
+    return (
+        str(latest.get("name") or ""),
+        str((latest.get("commit") or {}).get("sha") or ""),
+        "tag",
+    )
+
+def check_version_notice() -> dict[str, Any]:
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    current_commit = current_git_commit()
+    current_tag = current_git_tag()
+    result = {
+        "ok": True,
+        "update_available": False,
+        "show_notice": False,
+        "current_commit": current_commit,
+        "current_tag": current_tag,
+        "latest_tag": "",
+        "latest_commit": "",
+        "command": "ml update",
+        "message": "",
+    }
+
+    if not current_commit:
+        result["ok"] = False
+        result["message"] = "当前目录不是可识别的 Git 版本，跳过版本检测"
+        return result
+
+    try:
+        latest_tag, latest_commit, version_source = latest_github_version_ref()
+        result["version_source"] = version_source
+        if not latest_tag or not latest_commit:
+            result["message"] = "远程仓库尚未发布 tag，跳过版本提示"
+            return result
+        result["latest_tag"] = latest_tag
+        result["latest_commit"] = latest_commit
+
+        update_available = latest_commit != current_commit
+        try:
+            compare = github_api_get(
+                f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/compare/{current_commit}...{latest_commit}"
+            )
+            status = str(compare.get("status") or "")
+            result["compare_status"] = status
+            update_available = status in ("behind", "diverged")
+        except Exception as exc:
+            result["compare_error"] = str(exc)
+
+        result["update_available"] = update_available
+        if not update_available:
+            result["message"] = "当前版本已包含最新 tag"
+            return result
+
+        notice = read_json(VERSION_NOTICE_FILE, {})
+        last_shown_date = str(notice.get("last_shown_date") or "")
+        last_tag = str(notice.get("latest_tag") or "")
+        if last_shown_date != today or last_tag != latest_tag:
+            write_json(VERSION_NOTICE_FILE, {
+                "last_shown_date": today,
+                "latest_tag": latest_tag,
+                "latest_commit": latest_commit,
+                "shown_at": time.time(),
+            })
+            result["show_notice"] = True
+        result["message"] = "有新的版本发布，可在终端中输入 ml update 命令更新"
+        return result
+    except Exception as exc:
+        result["ok"] = False
+        result["message"] = f"版本检测失败: {exc}"
+        return result
+
+def trigger_login_refresh_if_needed() -> bool:
+    global is_connecting
+    if is_connecting or maintenance_lock.locked():
+        return False
+    marker = consume_login_refresh_required()
+    if marker is None and cached_nodes():
+        return False
+    reason = str((marker or {}).get("reason") or "first login refresh")
+    is_connecting = True
+    set_state(is_connecting=True, last_check_message=f"首次登录触发节点拉取与测速排序: {reason}")
+    threading.Thread(
+        target=refresh_test_prune_and_maybe_switch,
+        args=(f"login-triggered refresh: {reason}", "auto"),
+        daemon=True,
+    ).start()
+    return True
 
 def upstream_proxy_auth_file() -> str | None:
     username, password = vpn_utils.get_upstream_proxy_auth()
@@ -401,7 +560,7 @@ def load_ui_config() -> dict[str, Any]:
             "host": UI_HOST,
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
-            "routing_mode": "fixed_ip",
+            "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
             "connection_enabled": True,
@@ -418,6 +577,14 @@ def load_ui_config() -> dict[str, Any]:
                 for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
                     if key not in data:
                         updated = True
+                if (
+                    data.get("routing_mode") == "fixed_ip"
+                    and not data.get("fixed_node_id")
+                    and not data.get("default_route_auto_migrated")
+                ):
+                    config["routing_mode"] = "auto"
+                    config["default_route_auto_migrated"] = True
+                    updated = True
             except Exception:
                 pass
         
@@ -558,7 +725,7 @@ def get_state() -> dict[str, Any]:
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
-    state["routing_mode"] = ui_cfg.get("routing_mode", "fixed_ip")
+    state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
@@ -1988,7 +2155,7 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
     return candidates
 
 def node_in_routing_test_scope(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
-    routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+    routing_mode = ui_cfg.get("routing_mode", "auto")
     if node.get("manual_blacklisted"):
         return False
     if routing_mode == "auto":
@@ -2024,7 +2191,7 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
     is_connecting = True
     try:
         ui_cfg = load_ui_config()
-        routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+        routing_mode = ui_cfg.get("routing_mode", "auto")
         fav_ids = set(favorite_node_ids(ui_cfg))
         nodes = read_nodes()
         scope_ids = [
@@ -2107,7 +2274,7 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
         set_state(last_check_message=msg)
         raise
     finally:
-        is_connecting = previous_connecting if active_openvpn_node_id else False
+        is_connecting = False
         maintenance_lock.release()
 
 def favorite_node_ids(ui_cfg: dict[str, Any]) -> list[str]:
@@ -2254,7 +2421,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
-def refresh_test_prune_and_maybe_switch(reason: str) -> str:
+def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str | None = None) -> str:
     global active_openvpn_node_id, is_connecting
     ensure_dirs()
     if not maintenance_lock.acquire(blocking=False):
@@ -2267,7 +2434,7 @@ def refresh_test_prune_and_maybe_switch(reason: str) -> str:
     active_id = active_openvpn_node_id
     try:
         ui_cfg = load_ui_config()
-        routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+        routing_mode = routing_mode_override or ui_cfg.get("routing_mode", "auto")
         fav_ids = set(favorite_node_ids(ui_cfg))
         fixed_ip_mode = routing_mode == "fixed_ip"
 
@@ -2344,6 +2511,11 @@ def refresh_test_prune_and_maybe_switch(reason: str) -> str:
             return msg
 
         ui_cfg = load_ui_config()
+        if routing_mode_override:
+            ui_cfg = dict(ui_cfg)
+            ui_cfg["routing_mode"] = routing_mode_override
+            ui_cfg["force_country"] = ""
+            ui_cfg["routing_ip_type"] = "all"
         candidates = filter_routing_candidates(pruned, ui_cfg, exclude_active=False)
         if not candidates:
             msg = "节点测速排序完成，但没有符合当前路由模式的可用节点"
@@ -2363,7 +2535,7 @@ def refresh_test_prune_and_maybe_switch(reason: str) -> str:
         set_state(last_check_message=msg)
         raise
     finally:
-        is_connecting = previous_connecting if active_openvpn_node_id else False
+        is_connecting = False
         maintenance_lock.release()
 
 def connect_node(node_id: str) -> str:
@@ -2621,7 +2793,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
-                    routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+                    routing_mode = ui_cfg.get("routing_mode", "auto")
                     target_country = ui_cfg.get("force_country", "")
                     
                     if routing_mode != "fixed_ip":
@@ -2659,8 +2831,23 @@ def collector_loop() -> None:
                     success = True
                 log_to_json("INFO", "Main", f"首次同步与检测任务完成，结果: {res}")
             else:
-                success = True
-                set_state(last_check_message="节点缓存已存在，后台不再无条件刷新；仅在活动节点延迟超过阈值时刷新")
+                ui_cfg = load_ui_config()
+                routing_mode = ui_cfg.get("routing_mode", "auto")
+                if (
+                    ui_cfg.get("connection_enabled", True)
+                    and routing_mode != "fixed_ip"
+                    and not active_openvpn_node_id
+                    and not active_openvpn_running()
+                ):
+                    print("[守护线程] 节点缓存已存在但没有活动连接，按当前路由模式执行一次测速排序与切换。", flush=True)
+                    log_to_json("INFO", "Main", "节点缓存已存在但没有活动连接，按当前路由模式执行一次测速排序与切换。")
+                    res = test_current_routing_scope_and_maybe_switch("startup cached nodes")
+                    if "没有可测速节点" not in res:
+                        success = True
+                    log_to_json("INFO", "Main", f"缓存节点启动测速切换完成，结果: {res}")
+                else:
+                    success = True
+                    set_state(last_check_message="节点缓存已存在，后台不再无条件刷新；仅在活动节点延迟超过阈值时刷新")
         except Exception as exc:
             err_msg = f"周期节点同步任务执行异常: {exc}"
             print(f"[错误] {err_msg}", flush=True)
@@ -3994,13 +4181,13 @@ INDEX_HTML = r"""<!doctype html>
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站路由模式</label>
-            <input type="hidden" id="net_routing_mode" value="fixed_ip">
+            <input type="hidden" id="net_routing_mode" value="auto">
             <div class="option-group" id="routing_mode_group">
-              <div class="option-card" data-value="auto" onclick="setRoutingMode('auto')">
+              <div class="option-card active" data-value="auto" onclick="setRoutingMode('auto')">
                 <div class="option-card-title">自动配置</div>
                 <div class="option-card-desc">智能切换，最稳定</div>
               </div>
-              <div class="option-card active" data-value="fixed_ip" onclick="setRoutingMode('fixed_ip')">
+              <div class="option-card" data-value="fixed_ip" onclick="setRoutingMode('fixed_ip')">
                 <div class="option-card-title">固定 IP</div>
                 <div class="option-card-desc">锁定IP，不自动切换</div>
               </div>
@@ -4157,6 +4344,25 @@ INDEX_HTML = r"""<!doctype html>
           </button>
         </div>
         <button type="button" onclick="closeLogsModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="version_update_modal" class="modal">
+    <div class="modal-content" style="max-width: 460px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary);">发现新版本</h3>
+        <button type="button" onclick="closeVersionUpdateModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div style="font-size: 14px; color: var(--text-secondary); line-height: 1.7;">
+        <div id="version_update_message">有新的版本发布，可在终端中输入 ml update 命令更新</div>
+        <div id="version_update_tag" style="margin-top: 8px; color: var(--text-primary); font-family: 'JetBrains Mono', monospace;"></div>
+      </div>
+      <div style="margin-top: 18px; padding: 12px; border-radius: 10px; background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); font-family: 'JetBrains Mono', monospace; color: #a5b4fc;">ml update</div>
+      <div style="display: flex; justify-content: flex-end; margin-top: 20px;">
+        <button type="button" onclick="closeVersionUpdateModal()" style="height: 38px; padding: 0 20px; font-weight: 600;">取消</button>
       </div>
     </div>
   </div>
@@ -4834,6 +5040,26 @@ async function load(){
     startConnectionPolling();
   }
 }
+
+function closeVersionUpdateModal() {
+  const modal = $("version_update_modal");
+  if (modal) modal.style.display = "none";
+}
+
+async function checkVersionNotice() {
+  try {
+    const res = await fetch("./api/version_check");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || !data.show_notice) return;
+    const msg = $("version_update_message");
+    const tag = $("version_update_tag");
+    if (msg) msg.textContent = data.message || "有新的版本发布，可在终端中输入 ml update 命令更新";
+    if (tag) tag.textContent = data.latest_tag ? `最新版本: ${data.latest_tag}` : "";
+    const modal = $("version_update_modal");
+    if (modal) modal.style.display = "flex";
+  } catch (e) {}
+}
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
@@ -5108,7 +5334,7 @@ async function handleFavFallbackChange(checked) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        routing_mode: state.routing_mode || "fixed_ip",
+        routing_mode: state.routing_mode || "auto",
         force_country: state.force_country || "",
         routing_ip_type: state.routing_ip_type || "all",
         fav_fail_fallback: checked
@@ -5343,7 +5569,7 @@ function openNetworkModal() {
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
-    const mode = state.routing_mode || "fixed_ip";
+    const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
     
     selectOptionCard('routing_mode', mode);
@@ -5456,7 +5682,7 @@ async function logoutAdmin() {
 }
 
 // 页面加载时自动初始化数据
-load();
+load().then(checkVersionNotice).catch(() => {});
 
 // 每 10 秒在前台自动更新节点与状态。后台刷新时也继续轮询，便于显示“测试中...”。
 setInterval(async () => {
@@ -5947,7 +6173,7 @@ def active_latency_refresh_guard() -> None:
         try:
             time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
             ui_cfg = load_ui_config()
-            routing_mode = ui_cfg.get("routing_mode", "fixed_ip")
+            routing_mode = ui_cfg.get("routing_mode", "auto")
             if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites", "fixed_favorites"):
                 continue
             if not ui_cfg.get("connection_enabled", True):
@@ -6067,6 +6293,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
+            trigger_login_refresh_if_needed()
             nodes = read_nodes()
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
@@ -6099,6 +6326,8 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/version_check":
+            self.send_json(check_version_notice())
         elif effective_path == "/api/manual_blacklist":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             search = query.get("search", [""])[0]
@@ -6369,7 +6598,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 
                 new_proxy_port = payload.get("proxy_port")
-                routing_mode = str(payload.get("routing_mode") or "fixed_ip").strip()
+                routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 
@@ -6390,7 +6619,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ui_cfg = load_ui_config()
                 previous_route = (
-                    ui_cfg.get("routing_mode", "fixed_ip"),
+                    ui_cfg.get("routing_mode", "auto"),
                     ui_cfg.get("force_country", ""),
                     ui_cfg.get("routing_ip_type", "all"),
                     ui_cfg.get("fav_fail_fallback", True),
@@ -6437,7 +6666,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/update_routing":
             try:
                 payload = self.read_json_body()
-                routing_mode = str(payload.get("routing_mode") or "fixed_ip").strip()
+                routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 fav_fail_fallback = bool(payload.get("fav_fail_fallback", True))
@@ -6451,7 +6680,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ui_cfg = load_ui_config()
                 previous_route = (
-                    ui_cfg.get("routing_mode", "fixed_ip"),
+                    ui_cfg.get("routing_mode", "auto"),
                     ui_cfg.get("force_country", ""),
                     ui_cfg.get("routing_ip_type", "all"),
                     ui_cfg.get("fav_fail_fallback", True),

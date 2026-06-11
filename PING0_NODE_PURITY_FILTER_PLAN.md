@@ -354,7 +354,7 @@
 - `collector_loop()` 改为：
   - 仅在没有任何节点缓存时执行首次拉取。
   - 节点缓存已存在后，不再周期性无条件刷新。
-- 默认路由模式改为 `fixed_ip`。
+- 当时默认路由模式曾改为 `fixed_ip`；2026-06-11 后续已调整为 `auto`，以便首次部署后自动连接最低延迟可用节点。
 
 ### 已验证
 
@@ -427,7 +427,7 @@
 - 状态机收敛：
   - 旧的固定地区/固定收藏兜底入口改为调用统一的 `refresh_test_prune_and_maybe_switch()`。
   - 自动切换兜底补齐也改为统一的新旧节点合并测速排序流程。
-  - 配置接口缺省路由模式统一改为 `fixed_ip`。
+  - 配置接口缺省路由模式当时统一为 `fixed_ip`；2026-06-11 后续已调整为 `auto`。
 - README 更新：
   - 写明源项目地址与当前修改版仓库地址。
   - 更新一键部署命令到当前修改版仓库。
@@ -499,6 +499,60 @@
 - 本地模拟：固定地区模式只测速目标国家 + 目标 IP 类型，并切换到该范围最低延迟节点。
 - 本地模拟：自动配置模式测速当前全部节点，并切换到全局最低延迟节点。
 - 本地模拟：固定收藏菜单只测速收藏节点；收藏全失效且回退开启时，切换到非收藏最低延迟节点。
+
+## 2026-06-11 补充：首次连接与默认路由修正
+
+### 现象
+
+- 首次部署或有节点缓存但没有活动连接时，UI 可能停留在“正在连接 / 测试中”，即使测速排序已经完成，也没有立即连接到当前批次最低延迟节点。
+- 在“代理设置 / IP 出站路由模式”切换到固定地区、自动配置或固定收藏菜单后，后台测速流程结束后可能继续保留旧的 `is_connecting` 状态，导致前端看起来没有完成切换。
+- 默认路由模式仍为 `fixed_ip`，不符合后续要求的“默认自动配置”。
+
+### 调整
+
+- 默认路由模式统一改为 `auto`：
+  - `load_ui_config()` 默认值。
+  - API 缺省值。
+  - 前端代理设置弹窗默认选中项。
+- `refresh_test_prune_and_maybe_switch()` 和 `test_current_routing_scope_and_maybe_switch()` 在结束时明确释放 `is_connecting=False`，避免 UI 长时间卡在连接中。
+- 当节点缓存已存在但没有活动连接，且当前路由模式不是固定 IP 时，启动守护线程会基于缓存节点执行一次当前路由范围测速排序并切换最低延迟节点。
+- 首次拉取节点后的测速排序流程在默认自动配置下会立即连接当前批次最低延迟可用节点。
+
+### 验证
+
+- `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py` 通过。
+- 本地模拟自动配置：当前节点列表测速排序后切换到全局最低延迟节点，并清除 `is_connecting`。
+- 本地模拟固定地区 + 住宅 IP：只在目标国家和 IP 类型范围内测速，并切换到该范围最低延迟节点。
+- 本地模拟首次启动刷新：默认自动配置下拉取节点、测速排序后连接最低延迟节点。
+
+## 2026-06-11 补充：终端更新命令与版本 tag 提示
+
+### 方案
+
+- 保留并增强安装脚本生成的全局命令 `ml update`：
+  - 在 `/opt/aimilivpn` 内执行 `git fetch --all`。
+  - 对比当前分支本地 commit 与 `origin/<branch>`。
+  - 用户确认后 `git reset --hard origin/<branch>`。
+  - 重新运行当前仓库的 `install.sh zhishixuebao-0791 aimili-vpngate`，完成服务脚本更新与重启。
+- 安装完成提示区新增 `ml update` 命令，便于新用户知道后续更新方式。
+- 安装或 `ml update` 后写入 `vpngate_data/login_refresh_required.json`。
+- 用户首次登录 Web UI 后，`/api/nodes` 会消费该标记，并以自动配置规则触发：
+  - 从 VPNGate 拉取新节点。
+  - 与旧节点合并。
+  - 真实出口延迟测速排序。
+  - 剔除不可用普通节点。
+  - 自动连接当前批次最低延迟节点。
+- 新版本提示不跟随普通 commit，而是跟随 GitHub tag：
+  - 后端 `/api/version_check` 优先查询 `zhishixuebao-0791/aimili-vpngate` 最新 Release tag。
+  - 如果没有发布 Release，则回退查询仓库最新 tag。
+  - 使用 GitHub compare API 判断当前本地 commit 是否落后于最新 tag。
+  - 只有发布新 tag 且本地版本落后时，前端才弹出“有新的版本发布，可在终端中输入 ml update 命令更新”。
+  - 提示记录写入 `vpngate_data/version_notice.json`，同一 tag 每天最多提示一次。
+
+### 验证
+
+- `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py` 通过。
+- 本地 Windows 环境没有 `bash`，因此 `bash -n install.sh` 未执行；部署到 Linux VPS 后需补充验证 `ml update` 端到端流程。
 
 ### 后续建议
 

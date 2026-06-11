@@ -32,24 +32,40 @@ http://your_vps_ip:8787/随机安全后缀
 
 后续可在服务器终端输入 `ml` 打开交互式管理菜单。
 
+常用终端命令:
+
+```bash
+ml status    # 查看状态
+ml logs      # 查看实时日志
+ml update    # 从本仓库拉取最新代码并更新服务
+ml restart   # 重启服务
+```
+
 ## 首次使用
 
 1. 打开部署完成后输出的 Web 管理后台地址。
 2. 首次进入后，系统会自动拉取 VPNGate 候选节点并执行一次真实出口延迟测速排序。
 3. 测速未完成前，新节点状态会显示“测试中...”动态效果。
 4. 测速结束后，仅保留延迟小于等于 `500ms` 的普通可用节点；已收藏节点不会因为后续测速失败被自动清理。
-5. 默认路由模式为“固定 IP”，手动切换节点后不会自动漂移到其他节点。
+5. 默认路由模式为“自动配置”，首次测速排序完成后会立即连接当前批次延迟最低的可用节点。
 
 ## 本修改版新增/调整功能
 
 - 真实出口延迟测速: 通过当前 OpenVPN + 本地代理出口检测节点实际延迟，不再只看 VPNGate 原始 ping。
+- 首次自动连接: 首次部署或已有缓存但没有活动连接时，会按当前路由模式测速排序，并自动连接符合规则的最低延迟节点。
+- 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按自动配置连接最低延迟节点。
 - 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序。
+- 终端一键更新: 新增 `ml update` 命令，可在服务器终端从当前 GitHub 仓库拉取最新代码、重跑安装脚本并重启服务。
+- 新版本提示: Web UI 登录后会优先检测 GitHub 最新 Release tag，没有 Release 时检测最新 tag；只有仓库发布新 tag 时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
 - 高延迟触发刷新: 每 30 分钟检测当前已连接节点，只有延迟大于 `500ms` 才触发新一轮拉取、合并、测速、剔除。
 - 延迟过滤: 延迟大于 `500ms` 的普通节点会被剔除或标记不可用。
-- 默认固定 IP: 默认不自动切换，适合需要稳定出口 IP 的使用场景。
+- 5 秒测速超时: 单个节点测速超过 `5s` 会判定超时，延迟显示 `-1`，普通超时节点会在测速排序后剔除。
+- 默认自动配置: 默认会在测速完成后选择最低延迟可用节点，适合首次部署后尽快获得可用出口。
+- 旧配置迁移: 如果旧版本保存的是固定 IP 模式但没有锁定具体节点，更新后会自动迁移为自动配置；已经锁定具体节点的固定 IP 配置不会被改动。
 - 自动配置模式: 当前连接延迟过高时，会切换到所有可用节点中延迟最低的节点。
 - 固定地区模式: 当前连接延迟过高时，会切换到所选国家/地区、所选 IP 类型中延迟最低的节点。
 - 固定收藏菜单模式: 当前连接延迟过高时，只在收藏节点中测速排序并切换到最低延迟收藏节点。
+- 路由切换即时生效: 在“代理设置”切换自动配置、固定地区、固定 IP 或固定收藏菜单后，会按新模式的节点范围立即测速排序；除固定 IP 外，会切换到该范围内最低延迟可用节点。
 - 收藏菜单: 收藏节点后，即使后续延迟变高或不可用，也不会自动移出收藏，只能用户手动取消收藏。
 - 拉黑菜单: 支持持久拉黑 IP、搜索、添加、取消拉黑；被拉黑 IP 即使重新测速通过也保持不可用。
 - 拉黑保护: 如果意外连接到拉黑 IP，会立即断开并切换到当前列表中最低延迟的非拉黑可用节点。
@@ -59,10 +75,10 @@ http://your_vps_ip:8787/随机安全后缀
 
 ## 路由模式说明
 
-- 固定 IP: 默认模式。不会因为当前节点不可用而自动切换，但仍会定期测速并刷新候选节点列表。
-- 自动配置: 当前已连接节点延迟大于 `500ms` 时，合并新旧节点测速，并切到全局最低延迟可用节点。
-- 固定地区: 当前已连接节点延迟大于 `500ms` 时，只在指定国家/地区和 IP 类型范围内选择最低延迟节点。
-- 固定收藏菜单: 当前已连接节点延迟大于 `500ms` 时，只在收藏节点中选择最低延迟节点。
+- 自动配置: 默认模式。首次测速、手动更新、模式切换或当前已连接节点延迟大于 `500ms` 时，会选择全局最低延迟可用节点。
+- 固定 IP: 锁定当前手动选择的节点，不会因为当前节点不可用而自动切换，但仍会定期测速并刷新候选节点列表。
+- 固定地区: 只在指定国家/地区和 IP 类型范围内测速排序，并选择最低延迟节点。
+- 固定收藏菜单: 只在收藏节点中测速排序并选择最低延迟节点；如果收藏节点全部不可用，是否回退到非收藏节点由收藏管理面板选项决定。
 
 ## 端口与安全
 
@@ -86,6 +102,12 @@ firewall-cmd --reload
 ## 更新服务器上的修改版
 
 如果已经通过本仓库部署到 `/opt/aimilivpn`，可在服务器执行:
+
+```bash
+ml update
+```
+
+也可以手动执行:
 
 ```bash
 cd /opt/aimilivpn
@@ -136,13 +158,28 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpn
 
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 
+Useful commands:
+
+```bash
+ml status
+ml logs
+ml update
+ml restart
+```
+
 ## Key Differences From The Original Project
 
 - Real egress latency testing through the active OpenVPN/local proxy path.
-- First-login automatic benchmark and sorting.
+- First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
+- After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node is connected in automatic mode.
+- Added `ml update` for pulling the latest GitHub code, rerunning the installer, and restarting the service.
+- Web UI checks the latest GitHub Release tag, falling back to the latest tag, and shows an update notice only when a new tag is published; ordinary commits do not trigger the notice.
 - Manual refresh merges old and new VPNGate candidates, then benchmarks and sorts them together.
 - Nodes above `500ms` are marked unavailable or pruned, while favorites are preserved.
-- Default route mode is fixed IP.
+- Per-node benchmark timeout is `5s`; timed-out regular nodes are shown as `-1` and pruned after sorting.
+- Default route mode is automatic configuration.
+- Legacy configs saved as fixed IP without a locked node are migrated to automatic configuration; fixed IP configs with a locked node are preserved.
+- Route mode changes immediately trigger scoped benchmarking and, except fixed IP mode, switch to the lowest-latency eligible node.
 - Added fixed region and fixed favorites failover logic.
 - Added persistent IP blacklist management.
 - Added favorite/blacklist UI rules.

@@ -190,6 +190,7 @@ import shutil
 
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
+LOGIN_REFRESH_REQUIRED_FILE = "/opt/aimilivpn/vpngate_data/login_refresh_required.json"
 
 def generate_random_password():
     import random
@@ -243,6 +244,15 @@ def load_state():
         except Exception:
             pass
     return state
+
+def mark_login_refresh_required(reason="ml update"):
+    import json
+    os.makedirs(os.path.dirname(LOGIN_REFRESH_REQUIRED_FILE), exist_ok=True)
+    try:
+        with open(LOGIN_REFRESH_REQUIRED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"reason": reason, "created_at": time.time()}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 def get_active_node_info():
     import json
@@ -559,13 +569,14 @@ def update_service():
             
             print(f"\n正在强制重置本地代码至 origin/{branch} ...", flush=True)
             subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
+            mark_login_refresh_required("ml update")
             
             # Clean up python cache files
             print("正在清理 Python 缓存 (pycache)...", flush=True)
             subprocess.run(["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], check=False)
             
             print("代码拉取成功，正在重新运行安装脚本...", flush=True)
-            subprocess.run(["bash", "install.sh"])
+            subprocess.run(["bash", "install.sh", "zhishixuebao-0791", "aimili-vpngate"])
             print("更新已完成！")
             time.sleep(2)
         except Exception as e:
@@ -1069,6 +1080,13 @@ with open(auth_file, "w", encoding="utf-8") as f:
 PY
 fi
 
+cat > "${INSTALL_DIR}/vpngate_data/login_refresh_required.json" <<EOF
+{
+  "reason": "install or update completed",
+  "created_at": $(date +%s)
+}
+EOF
+
 # 8. Start service
 # 8.5 Optimize network parameters (rp_filter for policy routing)
 echo -e "\n正在优化网络参数 (配置反向路径过滤 rp_filter=2 以支持策略路由)..."
@@ -1178,6 +1196,7 @@ echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
+echo -e "  * 一键更新版本:   ${YELLOW}ml update${PLAIN}"
 echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
 echo -e "=========================================================="
