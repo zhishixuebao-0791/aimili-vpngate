@@ -24,6 +24,7 @@ from typing import Any
 import concurrent.futures
 import sys
 import uuid
+import traceback
 
 # Prefer IPv4 resolution to avoid slow AAAA DNS timeouts (e.g. in WSL),
 # but fall back to system default (IPv6) if IPv4 resolution fails.
@@ -113,8 +114,12 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 NODE_PROBE_TIMEOUT_SECONDS = env_int("NODE_PROBE_TIMEOUT_SECONDS", 5, 1)
 NODE_TIMEOUT_LATENCY_MS = -1
-FIXED_REGION_LATENCY_CHECK_SECONDS = 30 * 60
-FIXED_REGION_LATENCY_FAILOVER_MS = 500
+LATENCY_CHECK_INTERVAL_CHOICES_MINUTES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+LATENCY_THRESHOLD_CHOICES_MS = [200, 300, 400, 500, 600, 700, 800, 900, 1000]
+DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES = 30
+DEFAULT_LATENCY_THRESHOLD_MS = 500
+FIXED_REGION_LATENCY_CHECK_SECONDS = DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES * 60
+FIXED_REGION_LATENCY_FAILOVER_MS = DEFAULT_LATENCY_THRESHOLD_MS
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
 OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
@@ -123,7 +128,7 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
-NODE_LATENCY_LIMIT_MS = 500
+NODE_LATENCY_LIMIT_MS = DEFAULT_LATENCY_THRESHOLD_MS
 PURITY_DISPLAY_FIXED_SCORE = 60
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -137,6 +142,7 @@ BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 MANUAL_BLACKLIST_FILE = DATA_DIR / "manual_blacklist.json"
 LOGIN_REFRESH_REQUIRED_FILE = DATA_DIR / "login_refresh_required.json"
 VERSION_NOTICE_FILE = DATA_DIR / "version_notice.json"
+NODE_ACTIVITY_LOG_FILE = DATA_DIR / "node_activity.log"
 UPDATE_REPO_OWNER = os.environ.get("AIMILI_UPDATE_REPO_OWNER", "zhishixuebao-0791")
 UPDATE_REPO_NAME = os.environ.get("AIMILI_UPDATE_REPO_NAME", "aimili-vpngate")
 
@@ -479,6 +485,7 @@ def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
         save_manual_blacklist(data)
     removed_node_ids: set[str] = set()
     restored_node_ids: set[str] = set()
+    latency_threshold = get_latency_threshold_ms()
     with lock:
         nodes = read_json(NODES_FILE, [])
         if isinstance(nodes, list):
@@ -486,7 +493,7 @@ def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
                 if not isinstance(node, dict) or node_ip_value(node) != normalized:
                     continue
                 latency = parse_int(node.get("latency_ms"))
-                if latency > 0 and latency <= NODE_LATENCY_LIMIT_MS:
+                if latency > 0 and latency <= latency_threshold:
                     node["manual_blacklisted"] = False
                     node.pop("blacklisted_ip", None)
                     node["probe_status"] = "available"
@@ -566,7 +573,10 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": True
+            "fav_fail_fallback": True,
+            "latency_check_interval_minutes": DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES,
+            "latency_threshold_ms": DEFAULT_LATENCY_THRESHOLD_MS,
+            "latency_policy_updated_at": 0,
         }
         updated = False
         if auth_file.exists():
@@ -574,7 +584,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "latency_check_interval_minutes", "latency_threshold_ms", "latency_policy_updated_at"]:
                     if key not in data:
                         updated = True
                 if (
@@ -610,6 +620,20 @@ def load_ui_config() -> dict[str, Any]:
         if normalized_proxy_port != config.get("proxy_port"):
             config["proxy_port"] = normalized_proxy_port
             updated = True
+
+        normalized_latency_interval = parse_int(config.get("latency_check_interval_minutes"))
+        if normalized_latency_interval not in LATENCY_CHECK_INTERVAL_CHOICES_MINUTES:
+            normalized_latency_interval = DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES
+        if normalized_latency_interval != config.get("latency_check_interval_minutes"):
+            config["latency_check_interval_minutes"] = normalized_latency_interval
+            updated = True
+
+        normalized_latency_threshold = parse_int(config.get("latency_threshold_ms"))
+        if normalized_latency_threshold not in LATENCY_THRESHOLD_CHOICES_MS:
+            normalized_latency_threshold = DEFAULT_LATENCY_THRESHOLD_MS
+        if normalized_latency_threshold != config.get("latency_threshold_ms"):
+            config["latency_threshold_ms"] = normalized_latency_threshold
+            updated = True
             
         if not auth_file.exists() or updated:
             try:
@@ -619,6 +643,37 @@ def load_ui_config() -> dict[str, Any]:
                 pass
                 
         return config
+
+def get_latency_threshold_ms(ui_cfg: dict[str, Any] | None = None) -> int:
+    cfg = ui_cfg if ui_cfg is not None else load_ui_config()
+    value = parse_int(cfg.get("latency_threshold_ms"))
+    return value if value in LATENCY_THRESHOLD_CHOICES_MS else DEFAULT_LATENCY_THRESHOLD_MS
+
+def get_latency_check_interval_minutes(ui_cfg: dict[str, Any] | None = None) -> int:
+    cfg = ui_cfg if ui_cfg is not None else load_ui_config()
+    value = parse_int(cfg.get("latency_check_interval_minutes"))
+    return value if value in LATENCY_CHECK_INTERVAL_CHOICES_MINUTES else DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES
+
+def get_latency_check_interval_seconds(ui_cfg: dict[str, Any] | None = None) -> int:
+    return get_latency_check_interval_minutes(ui_cfg) * 60
+
+def wait_latency_check_interval() -> dict[str, Any]:
+    cfg = load_ui_config()
+    policy_seen = float(cfg.get("latency_policy_updated_at") or 0)
+    start_time = time.time()
+    while True:
+        interval = get_latency_check_interval_seconds(cfg)
+        target_time = start_time + interval
+        now = time.time()
+        if now >= target_time:
+            return load_ui_config()
+        time.sleep(min(5.0, max(0.5, target_time - now)))
+        latest = load_ui_config()
+        latest_policy = float(latest.get("latency_policy_updated_at") or 0)
+        if latest_policy > policy_seen:
+            cfg = latest
+            policy_seen = latest_policy
+            start_time = latest_policy
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
@@ -685,6 +740,83 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+def describe_node_for_activity(node: dict[str, Any] | None) -> str:
+    if not isinstance(node, dict):
+        return "node=<unknown>"
+    node_id = str(node.get("id") or "")
+    ip = node_ip_value(node) or str(node.get("ip") or node.get("remote_host") or "")
+    port = str(node.get("remote_port") or node.get("port") or "")
+    country = str(node.get("country") or node.get("country_long") or "")
+    latency = str(node.get("latency_ms") or node.get("ping") or "")
+    parts = []
+    if node_id:
+        parts.append(f"id={node_id}")
+    if ip:
+        parts.append(f"ip={ip}")
+    if port:
+        parts.append(f"port={port}")
+    if country:
+        parts.append(f"country={country}")
+    if latency:
+        parts.append(f"latency={latency}ms")
+    return " ".join(parts) if parts else "node=<unknown>"
+
+def log_node_activity(event: str, message: str, node: dict[str, Any] | None = None, exc: BaseException | None = None) -> None:
+    try:
+        ensure_dirs()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"[{timestamp}] [{event}] {message}"
+        node_desc = describe_node_for_activity(node)
+        if node_desc != "node=<unknown>":
+            line += f" | {node_desc}"
+        if exc is not None:
+            line += f" | exception={type(exc).__name__}: {exc}"
+        with lock:
+            with open(NODE_ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                if exc is not None:
+                    f.write(traceback.format_exc() + "\n")
+        if event in ("ERROR", "CRASH", "STALL", "SWITCH_FAILED"):
+            log_to_json("ERROR", "NodeActivity", line)
+        elif event in ("WARNING", "SLOW_ACTIVE", "BLACKLIST_DISCONNECT"):
+            log_to_json("WARNING", "NodeActivity", line)
+        else:
+            log_to_json("INFO", "NodeActivity", line)
+    except Exception as log_exc:
+        print(f"[NodeActivityLog Error] {log_exc}", flush=True)
+
+def install_crash_log_hooks() -> None:
+    def handle_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        try:
+            ensure_dirs()
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            with lock:
+                with open(NODE_ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"[{timestamp}] [CRASH] Unhandled exception: {exc_type.__name__}: {exc_value}\n")
+                    traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+            log_to_json("ERROR", "Crash", f"Unhandled exception: {exc_type.__name__}: {exc_value}")
+        finally:
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = handle_exception
+
+    if hasattr(threading, "excepthook"):
+        def handle_thread_exception(args):
+            try:
+                ensure_dirs()
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                with lock:
+                    with open(NODE_ACTIVITY_LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"[{timestamp}] [CRASH] Thread {args.thread.name if args.thread else '<unknown>'} crashed: {args.exc_type.__name__}: {args.exc_value}\n")
+                        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=f)
+                log_to_json("ERROR", "Crash", f"Thread crashed: {args.exc_type.__name__}: {args.exc_value}")
+            except Exception as hook_exc:
+                print(f"[CrashHook Error] {hook_exc}", flush=True)
+        threading.excepthook = handle_thread_exception
+
 def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
@@ -732,6 +864,8 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = ui_cfg.get("fav_fail_fallback", True)
+    state["latency_check_interval_minutes"] = get_latency_check_interval_minutes(ui_cfg)
+    state["latency_threshold_ms"] = get_latency_threshold_ms(ui_cfg)
     
     return state
 
@@ -1596,14 +1730,16 @@ def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep
 def node_passes_current_latency(node: dict[str, Any] | None) -> bool:
     if not node:
         return False
+    threshold = get_latency_threshold_ms()
     latency = parse_int(node.get("latency_ms"))
-    return latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
+    return latency > 0 and latency <= threshold
 
 def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool:
     if not node:
         return False
+    threshold = get_latency_threshold_ms()
     latency = parse_int(node.get("latency_ms"))
-    return latency == NODE_TIMEOUT_LATENCY_MS or latency > NODE_LATENCY_LIMIT_MS
+    return latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold
 
 def remove_nodes_by_ids(node_ids: set[str]) -> None:
     if not node_ids:
@@ -1866,6 +2002,7 @@ def timeout_probe_result(node_info: dict[str, Any], message: str | None = None) 
 
 def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
     node_id = str(node_info.get("id") or "")
+    latency_threshold = get_latency_threshold_ms()
     probe_deadline = time.monotonic() + NODE_PROBE_TIMEOUT_SECONDS
     manual = load_manual_blacklist()
     if apply_manual_blacklist_to_node(node_info, manual):
@@ -1897,8 +2034,8 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         latency = parse_int(active_result.get("latency_ms"))
         if not active_result.get("ok") and is_probe_timeout_message(active_result.get("error")):
             latency = NODE_TIMEOUT_LATENCY_MS
-        ok = bool(active_result.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
-        message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms")
+        ok = bool(active_result.get("ok")) and latency > 0 and latency <= latency_threshold
+        message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > {latency_threshold} ms")
         result = {
             "id": node_id,
             "ip": node_info.get("ip") or node_info.get("remote_host") or "",
@@ -1972,13 +2109,13 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             probe = measure_interface_egress_latency(dev_name, timeout=NODE_PROBE_TIMEOUT_SECONDS, deadline=probe_deadline)
             latency = parse_int(probe.get("latency_ms"))
             egress_ip = str(probe.get("ip") or "")
-            ok = bool(probe.get("ok")) and latency > 0 and latency <= NODE_LATENCY_LIMIT_MS
+            ok = bool(probe.get("ok")) and latency > 0 and latency <= latency_threshold
             if not probe.get("ok"):
                 message = str(probe.get("error") or "egress latency probe failed")
                 if is_probe_timeout_message(message) or latency == NODE_TIMEOUT_LATENCY_MS:
                     latency = NODE_TIMEOUT_LATENCY_MS
-            elif latency > NODE_LATENCY_LIMIT_MS:
-                message = f"Real egress latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms"
+            elif latency > latency_threshold:
+                message = f"Real egress latency {latency} ms > {latency_threshold} ms"
             else:
                 message = f"Real egress latency ok: {latency} ms"
     finally:
@@ -2435,6 +2572,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
     try:
         ui_cfg = load_ui_config()
         routing_mode = routing_mode_override or ui_cfg.get("routing_mode", "auto")
+        latency_threshold = get_latency_threshold_ms(ui_cfg)
         fav_ids = set(favorite_node_ids(ui_cfg))
         fixed_ip_mode = routing_mode == "fixed_ip"
 
@@ -2480,7 +2618,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
                 keep_unavailable_active_without_fallback = not favorite_available and bool(active_id)
             for node in tested_nodes:
                 if node.get("id") == active_id:
-                    node["latency_ms"] = max(parse_int(node.get("latency_ms")), NODE_LATENCY_LIMIT_MS + 1)
+                    node["latency_ms"] = max(parse_int(node.get("latency_ms")), latency_threshold + 1)
                     if not fixed_ip_mode and not keep_unavailable_active_without_fallback:
                         node["active"] = False
                         node["probe_status"] = "unavailable"
@@ -2558,9 +2696,14 @@ def connect_node(node_id: str) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+        old_node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None) if active_openvpn_node_id else None
         if apply_manual_blacklist_to_node(node):
             write_json(NODES_FILE, nodes)
             raise RuntimeError(f"Node IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('ip') or node.get('remote_host')}")
+        if old_node and old_node.get("id") != node_id:
+            log_node_activity("SWITCH_REQUEST", f"Switch requested from {old_node.get('id')} to {node_id}", node)
+        else:
+            log_node_activity("CONNECT_REQUEST", f"Connect requested for {node_id}", node)
         
         ui_cfg = load_ui_config()
         ui_cfg["connection_enabled"] = True
@@ -2593,6 +2736,7 @@ def connect_node(node_id: str) -> str:
                 pass
             node["probe_status"] = "unavailable"
             node["probe_message"] = message
+            log_node_activity("SWITCH_FAILED", f"OpenVPN failed while connecting {node_id}: {message}", node)
             for item in nodes:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
@@ -2654,9 +2798,22 @@ def connect_node(node_id: str) -> str:
             
         latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
+        if old_node and old_node.get("id") != node_id:
+            log_node_activity("SWITCH", f"Switched from {old_node.get('id')} to {node_id}", node)
+        else:
+            log_node_activity("CONNECTED", f"Connected to {node_id}", node)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
     except Exception as exc:
+        try:
+            failed_node = None
+            for item in read_nodes():
+                if item.get("id") == node_id:
+                    failed_node = item
+                    break
+            log_node_activity("SWITCH_FAILED", f"Connect failed for {node_id}", failed_node, exc)
+        except Exception:
+            pass
         if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
             clear_active_connection_state(f"连接失败: {exc}")
         else:
@@ -4227,6 +4384,40 @@ INDEX_HTML = r"""<!doctype html>
               </div>
             </div>
           </div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_latency_check_interval">活动节点巡检间隔</label>
+              <select id="net_latency_check_interval" class="input-field" onchange="updateLatencyPolicyWarning()">
+                <option value="5">5分钟</option>
+                <option value="10">10分钟</option>
+                <option value="15">15分钟</option>
+                <option value="20">20分钟</option>
+                <option value="25">25分钟</option>
+                <option value="30" selected>30分钟</option>
+                <option value="35">35分钟</option>
+                <option value="40">40分钟</option>
+                <option value="45">45分钟</option>
+                <option value="50">50分钟</option>
+                <option value="55">55分钟</option>
+                <option value="60">60分钟</option>
+              </select>
+            </div>
+            <div class="form-group" style="margin-bottom: 0;">
+              <label class="form-label" for="net_latency_threshold">延迟筛选阈值</label>
+              <select id="net_latency_threshold" class="input-field" onchange="updateLatencyPolicyWarning()">
+                <option value="200">200ms</option>
+                <option value="300">300ms</option>
+                <option value="400">400ms</option>
+                <option value="500" selected>500ms</option>
+                <option value="600">600ms</option>
+                <option value="700">700ms</option>
+                <option value="800">800ms</option>
+                <option value="900">900ms</option>
+                <option value="1000">1000ms</option>
+              </select>
+            </div>
+          </div>
           
           <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
             ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。
@@ -5174,6 +5365,9 @@ function returnToAllNodes() {
 }
 
 async function toggleBlacklistView() {
+  if (showBlacklistPanel) {
+    return;
+  }
   showBlacklistPanel = !showBlacklistPanel;
   if (showBlacklistPanel) {
     showFavoritesOnly = false;
@@ -5285,6 +5479,9 @@ async function removeBlacklistIp(ip, event) {
 }
 
 function toggleFavoritesView() {
+  if (showFavoritesOnly) {
+    return;
+  }
   showFavoritesOnly = !showFavoritesOnly;
   if (showFavoritesOnly) showBlacklistPanel = false;
   currentPage = 1;
@@ -5391,16 +5588,31 @@ function setRoutingIpType(value) {
   selectOptionCard('routing_ip_type', value);
 }
 
+function latencyPolicyValues() {
+  const intervalEl = $("net_latency_check_interval");
+  const thresholdEl = $("net_latency_threshold");
+  return {
+    interval: parseInt(intervalEl ? intervalEl.value : 30) || 30,
+    threshold: parseInt(thresholdEl ? thresholdEl.value : 500) || 500
+  };
+}
+
+function updateLatencyPolicyWarning() {
+  const modeInput = $("net_routing_mode");
+  handleRoutingModeChange(modeInput ? modeInput.value : "auto");
+}
+
 function handleRoutingModeChange(mode) {
   const countryGroup = $("net_force_country_group");
   const warningDiv = $("net_routing_warning");
+  const policy = latencyPolicyValues();
   
   if (mode === "fixed_region") {
     countryGroup.style.display = "block";
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，并按当前 IP 类型过滤测速。后台每 ${policy.interval} 分钟检测当前活动节点，延迟超过 ${policy.threshold}ms 时会拉取新节点、新旧合并测速排序，并只保留符合阈值的节点。`;
   } else if (mode === "favorites") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -5412,7 +5624,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定收藏菜单</strong>：只在收藏节点范围内测速排序，并切换到延迟最低的收藏节点。后台每 30 分钟检测当前活动节点，延迟超过 500ms 时会标记不可用并重新在收藏节点中选择最低延迟节点；收藏全部不可用时是否回退到非收藏节点，由收藏管理面板的回退选项决定。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定收藏菜单</strong>：只在收藏节点范围内测速排序，并切换到延迟最低的收藏节点。后台每 ${policy.interval} 分钟检测当前活动节点，延迟超过 ${policy.threshold}ms 时会重新测速排序；收藏全部不可用时是否回退到非收藏节点，由收藏管理面板的回退选项决定。`;
   } else if (mode === "fixed_ip") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -5424,7 +5636,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--text-secondary)";
     warningDiv.style.background = "rgba(255, 255, 255, 0.02)";
     warningDiv.style.border = "1px solid rgba(255, 255, 255, 0.05)";
-    warningDiv.innerHTML = `ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。`;
+    warningDiv.innerHTML = `ℹ️ <strong>自动配置</strong>：后台每 ${policy.interval} 分钟检测当前活动节点；延迟超过 ${policy.threshold}ms 时会拉取新节点、新旧合并测速排序，剔除超过阈值的普通节点，并切换到最低延迟可用节点。`;
   }
 }
 
@@ -5569,6 +5781,8 @@ function openNetworkModal() {
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
+    $("net_latency_check_interval").value = state.latency_check_interval_minutes || 30;
+    $("net_latency_threshold").value = state.latency_threshold_ms || 500;
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
     
@@ -5598,6 +5812,8 @@ async function saveNetwork(e) {
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
+  const latencyCheckInterval = parseInt($("net_latency_check_interval").value);
+  const latencyThreshold = parseInt($("net_latency_threshold").value);
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -5616,6 +5832,18 @@ async function saveNetwork(e) {
     errorDivEl.style.display = "block";
     return;
   }
+
+  if (![5,10,15,20,25,30,35,40,45,50,55,60].includes(latencyCheckInterval)) {
+    errorDivEl.textContent = "活动节点巡检间隔无效";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (![200,300,400,500,600,700,800,900,1000].includes(latencyThreshold)) {
+    errorDivEl.textContent = "延迟筛选阈值无效";
+    errorDivEl.style.display = "block";
+    return;
+  }
   
   submitBtn.disabled = true;
   submitBtn.textContent = "正在保存...";
@@ -5628,7 +5856,9 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        latency_check_interval_minutes: latencyCheckInterval,
+        latency_threshold_ms: latencyThreshold
       })
     });
     
@@ -5647,8 +5877,10 @@ async function saveNetwork(e) {
       } else {
         successDiv.textContent = "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
-        state.is_connecting = true;
-        startConnectionPolling();
+        if (data.routing_refresh_started) {
+          state.is_connecting = true;
+          startConnectionPolling();
+        }
         setTimeout(() => {
           closeNetworkModal();
           load();
@@ -6087,8 +6319,7 @@ def fixed_region_latency_guard() -> None:
     time.sleep(60)
     while True:
         try:
-            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
-            ui_cfg = load_ui_config()
+            ui_cfg = wait_latency_check_interval()
             if ui_cfg.get("routing_mode") != "fixed_region":
                 continue
             if not ui_cfg.get("connection_enabled", True):
@@ -6102,11 +6333,13 @@ def fixed_region_latency_guard() -> None:
             if not result.get("ok"):
                 continue
             latency = parse_int(result.get("latency_ms"))
+            latency_threshold = get_latency_threshold_ms(ui_cfg)
             set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
-            if latency <= FIXED_REGION_LATENCY_FAILOVER_MS:
+            if latency <= latency_threshold:
                 continue
 
-            reason = f"固定地区半小时巡检发现当前节点真实出口延迟 {latency} ms > {FIXED_REGION_LATENCY_FAILOVER_MS} ms"
+            interval_minutes = get_latency_check_interval_minutes(ui_cfg)
+            reason = f"固定地区 {interval_minutes} 分钟巡检发现当前节点真实出口延迟 {latency} ms > {latency_threshold} ms"
             print(f"[固定地区延迟巡检] {reason}", flush=True)
             log_to_json("WARNING", "VPN", reason)
             with lock:
@@ -6120,7 +6353,11 @@ def fixed_region_latency_guard() -> None:
                     write_json(NODES_FILE, sort_all_nodes(nodes))
                     cleanup_favorite_node_ids(nodes)
 
+            before_id = active_openvpn_node_id
             refresh_and_switch_fixed_region(reason)
+            after_id = active_openvpn_node_id
+            if before_id and after_id == before_id:
+                log_node_activity("STALL", f"Latency exceeded threshold but fixed_region did not switch; reason={reason}", active_node)
         except Exception as exc:
             print(f"[固定地区延迟巡检] 执行异常: {exc}", flush=True)
             log_to_json("ERROR", "VPN", f"固定地区延迟巡检异常: {exc}")
@@ -6129,8 +6366,7 @@ def fixed_favorites_latency_guard() -> None:
     time.sleep(60)
     while True:
         try:
-            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
-            ui_cfg = load_ui_config()
+            ui_cfg = wait_latency_check_interval()
             if ui_cfg.get("routing_mode") != "fixed_favorites":
                 continue
             if not ui_cfg.get("connection_enabled", True):
@@ -6144,11 +6380,13 @@ def fixed_favorites_latency_guard() -> None:
             if not result.get("ok"):
                 continue
             latency = parse_int(result.get("latency_ms"))
+            latency_threshold = get_latency_threshold_ms(ui_cfg)
             set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
-            if latency <= FIXED_REGION_LATENCY_FAILOVER_MS:
+            if latency <= latency_threshold:
                 continue
 
-            reason = f"固定收藏菜单半小时巡检发现当前节点真实出口延迟 {latency} ms > {FIXED_REGION_LATENCY_FAILOVER_MS} ms"
+            interval_minutes = get_latency_check_interval_minutes(ui_cfg)
+            reason = f"固定收藏菜单 {interval_minutes} 分钟巡检发现当前节点真实出口延迟 {latency} ms > {latency_threshold} ms"
             print(f"[固定收藏延迟巡检] {reason}", flush=True)
             log_to_json("WARNING", "VPN", reason)
             with lock:
@@ -6162,7 +6400,11 @@ def fixed_favorites_latency_guard() -> None:
                     write_json(NODES_FILE, sort_all_nodes(nodes))
                     cleanup_favorite_node_ids(nodes)
 
+            before_id = active_openvpn_node_id
             refresh_and_switch_fixed_favorites(reason)
+            after_id = active_openvpn_node_id
+            if before_id and after_id == before_id:
+                log_node_activity("STALL", f"Latency exceeded threshold but fixed_favorites did not switch; reason={reason}", active_node)
         except Exception as exc:
             print(f"[固定收藏延迟巡检] 执行异常: {exc}", flush=True)
             log_to_json("ERROR", "VPN", f"固定收藏延迟巡检异常: {exc}")
@@ -6171,8 +6413,7 @@ def active_latency_refresh_guard() -> None:
     time.sleep(60)
     while True:
         try:
-            time.sleep(FIXED_REGION_LATENCY_CHECK_SECONDS)
-            ui_cfg = load_ui_config()
+            ui_cfg = wait_latency_check_interval()
             routing_mode = ui_cfg.get("routing_mode", "auto")
             if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites", "fixed_favorites"):
                 continue
@@ -6185,18 +6426,74 @@ def active_latency_refresh_guard() -> None:
             if not result.get("ok"):
                 continue
             latency = parse_int(result.get("latency_ms"))
+            latency_threshold = get_latency_threshold_ms(ui_cfg)
             set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
-            if latency <= NODE_LATENCY_LIMIT_MS:
+            if latency <= latency_threshold:
                 continue
 
-            reason = f"{routing_mode} mode active node egress latency {latency} ms > {NODE_LATENCY_LIMIT_MS} ms"
+            interval_minutes = get_latency_check_interval_minutes(ui_cfg)
+            reason = f"{routing_mode} mode {interval_minutes}m active node egress latency {latency} ms > {latency_threshold} ms"
             print(f"[活动节点延迟巡检] {reason}", flush=True)
             log_to_json("WARNING", "VPN", reason)
+            before_id = active_openvpn_node_id
+            active_node = None
+            try:
+                active_node = next((n for n in read_nodes() if n.get("id") == before_id), None) if before_id else None
+            except Exception:
+                active_node = None
             refresh_test_prune_and_maybe_switch(reason)
+            after_id = active_openvpn_node_id
+            if before_id and after_id == before_id and routing_mode != "fixed_ip":
+                log_node_activity("STALL", f"Latency exceeded threshold but active node did not switch; reason={reason}", active_node)
         except Exception as exc:
             print(f"[活动节点延迟巡检] 执行异常: {exc}", flush=True)
             log_to_json("ERROR", "VPN", f"活动节点延迟巡检异常: {exc}")
 
+def node_activity_logger_loop() -> None:
+    last_seen_node_id = None
+    connecting_since = None
+    last_stall_log = 0.0
+    last_process_error_log = 0.0
+    while True:
+        try:
+            state = read_json(STATE_FILE, {})
+            current_id = active_openvpn_node_id or str(state.get("active_openvpn_node_id") or "")
+            nodes = read_nodes()
+            current_node = next((n for n in nodes if n.get("id") == current_id), None) if current_id else None
+
+            if current_id != last_seen_node_id:
+                if current_id:
+                    log_node_activity("CURRENT_NODE", "Current active node changed", current_node)
+                elif last_seen_node_id:
+                    log_node_activity("DISCONNECTED", f"Active node cleared from {last_seen_node_id}")
+                last_seen_node_id = current_id
+
+            if current_id and not active_openvpn_running():
+                now = time.time()
+                if now - last_process_error_log >= 60:
+                    log_node_activity(
+                        "ERROR",
+                        f"State has active node {current_id}, but OpenVPN process is not running",
+                        current_node,
+                    )
+                    last_process_error_log = now
+
+            if is_connecting:
+                if connecting_since is None:
+                    connecting_since = time.time()
+                elapsed = time.time() - connecting_since
+                if elapsed > max(120, OPENVPN_TEST_TIMEOUT_SECONDS * 2) and time.time() - last_stall_log >= 60:
+                    log_node_activity(
+                        "STALL",
+                        f"Connection or latency test has been running for {int(elapsed)}s without completing; last_message={state.get('last_check_message', '')}",
+                        current_node,
+                    )
+                    last_stall_log = time.time()
+            else:
+                connecting_since = None
+        except Exception as exc:
+            log_node_activity("ERROR", "node_activity_logger_loop failed", exc=exc)
+        time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
     def get_secret_path(self) -> str:
@@ -6601,6 +6898,8 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                latency_check_interval = parse_int(payload.get("latency_check_interval_minutes"))
+                latency_threshold = parse_int(payload.get("latency_threshold_ms"))
                 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -6616,6 +6915,12 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
+                if latency_check_interval not in LATENCY_CHECK_INTERVAL_CHOICES_MINUTES:
+                    self.send_json({"ok": False, "error": "无效的活动节点巡检间隔"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if latency_threshold not in LATENCY_THRESHOLD_CHOICES_MS:
+                    self.send_json({"ok": False, "error": "无效的延迟筛选阈值"}, HTTPStatus.BAD_REQUEST)
+                    return
                 
                 ui_cfg = load_ui_config()
                 previous_route = (
@@ -6623,6 +6928,10 @@ class Handler(BaseHTTPRequestHandler):
                     ui_cfg.get("force_country", ""),
                     ui_cfg.get("routing_ip_type", "all"),
                     ui_cfg.get("fav_fail_fallback", True),
+                )
+                previous_latency_policy = (
+                    get_latency_check_interval_minutes(ui_cfg),
+                    get_latency_threshold_ms(ui_cfg),
                 )
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
                 
@@ -6634,6 +6943,10 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["latency_check_interval_minutes"] = latency_check_interval
+                ui_cfg["latency_threshold_ms"] = latency_threshold
+                if previous_latency_policy != (latency_check_interval, latency_threshold):
+                    ui_cfg["latency_policy_updated_at"] = time.time()
                 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
@@ -6651,14 +6964,21 @@ class Handler(BaseHTTPRequestHandler):
                     
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
-                    self.send_json({"ok": True, "restart_needed": False, "message": "配置更新成功，已即时生效！"})
                     next_route = (routing_mode, force_country, routing_ip_type, ui_cfg.get("fav_fail_fallback", True))
+                    routing_refresh_started = False
                     if previous_route != next_route and ui_cfg.get("connection_enabled", True):
                         threading.Thread(
                             target=test_current_routing_scope_and_maybe_switch,
                             args=("proxy settings changed",),
                             daemon=True,
                         ).start()
+                        routing_refresh_started = True
+                    self.send_json({
+                        "ok": True,
+                        "restart_needed": False,
+                        "routing_refresh_started": routing_refresh_started,
+                        "message": "配置更新成功，已即时生效！"
+                    })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -6876,6 +7196,8 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
+    install_crash_log_hooks()
+    log_node_activity("START", "AimiliVPN service starting")
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
@@ -6948,6 +7270,7 @@ def main() -> None:
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=active_latency_refresh_guard, daemon=True).start()
+    threading.Thread(target=node_activity_logger_loop, daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)

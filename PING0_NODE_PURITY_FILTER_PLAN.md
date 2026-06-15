@@ -554,6 +554,33 @@
 - `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py` 通过。
 - 本地 Windows 环境没有 `bash`，因此 `bash -n install.sh` 未执行；部署到 Linux VPS 后需补充验证 `ml update` 端到端流程。
 
+## 2026-06-15 补充：菜单返回与可调巡检策略
+
+### 调整
+
+- 收藏菜单与拉黑菜单行为对齐：
+  - 已进入“收藏管理面板”时，再次点击“收藏菜单”会调用 `returnToAllNodes()`。
+  - 已进入“拉黑IP管理面板”时，再次点击“拉黑菜单”会调用 `returnToAllNodes()`。
+  - 返回后恢复“全部节点 / 所有国家 / 所有IP类型”的主 IP 管理页。
+- 代理设置新增两个可调下拉项：
+  - 活动节点巡检间隔：5、10、15、20、25、30、35、40、45、50、55、60 分钟，默认 30 分钟。
+  - 延迟筛选阈值：200、300、400、500、600、700、800、900、1000ms，默认 500ms。
+- 后端新增配置字段：
+  - `latency_check_interval_minutes`
+  - `latency_threshold_ms`
+  - `latency_policy_updated_at`
+- 巡检线程改为读取 UI 配置：
+  - 保存巡检策略后，从保存时间重新计时。
+  - 下次巡检按新的间隔和阈值检测活动节点。
+  - 如果活动节点延迟超过新阈值，则触发 VPNGate 拉取、新旧节点合并、真实出口测速排序，并按新阈值过滤普通节点。
+- 单节点检测、批量测速、取消拉黑恢复、取消收藏清理等延迟判断同步改为读取当前阈值。
+
+### 验证
+
+- `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py` 通过。
+- 本地模拟：`ui_auth.json` 中字符串形式的 `latency_check_interval_minutes="10"` 和 `latency_threshold_ms="200"` 会被规范化为数字。
+- 本地模拟：当前阈值为 200ms 时，199ms 节点通过，201ms 节点不通过并会在取消收藏/取消拉黑等延迟判断中按失败处理。
+
 ### 后续建议
 
 1. 在真实 VPS 环境跑一次节点刷新，观察 `vpngate_data/nodes.json` 中的 `purity_score` 和 `probe_message`。
@@ -849,3 +876,24 @@
 ### 已验证
 
 - 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+## 2026-06-15 补充：菜单入口锁定与节点活动日志
+
+### 调整目标
+
+- “收藏菜单”或“拉黑菜单”打开后，再次点击同一个菜单按钮不再返回主 IP 管理页。
+- 返回主 IP 管理页只能通过管理面板左上角的“<- / 返回”按钮完成。
+- 增加长期运行的节点活动日志，记录当前使用节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
+
+### 已实现
+
+- 前端 `toggleFavoritesView()` 和 `toggleBlacklistView()` 已改为：如果当前面板已经打开，再次点击同一按钮直接忽略。
+- 后端新增 `vpngate_data/node_activity.log`。
+- 服务启动时安装主线程和后台线程异常 hook，未捕获异常会写入节点活动日志。
+- `connect_node()` 会记录连接请求、切换请求、连接成功、切换成功、OpenVPN 失败和异常栈。
+- 新增 `node_activity_logger_loop()` 守护线程，持续监控活动节点变化、OpenVPN 进程异常缺失、连接/测速长时间卡住等情况。
+- 安装脚本生成的 `ml` 命令新增 `ml node-log`，可实时查看节点活动日志。
+
+### 已验证
+
+- 已运行 `python -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py`，语法检查通过。
+- 已抽取 `install.sh` 中生成 `/usr/bin/ml` 的 Python here-doc 并执行 `py_compile`，语法检查通过。

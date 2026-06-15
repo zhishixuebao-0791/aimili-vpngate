@@ -37,6 +37,7 @@ http://your_vps_ip:8787/随机安全后缀
 ```bash
 ml status    # 查看状态
 ml logs      # 查看实时日志
+ml node-log  # 查看节点切换与异常追踪日志
 ml update    # 从本仓库拉取最新代码并更新服务
 ml restart   # 重启服务
 ```
@@ -46,7 +47,7 @@ ml restart   # 重启服务
 1. 打开部署完成后输出的 Web 管理后台地址。
 2. 首次进入后，系统会自动拉取 VPNGate 候选节点并执行一次真实出口延迟测速排序。
 3. 测速未完成前，新节点状态会显示“测试中...”动态效果。
-4. 测速结束后，仅保留延迟小于等于 `500ms` 的普通可用节点；已收藏节点不会因为后续测速失败被自动清理。
+4. 测速结束后，仅保留延迟小于等于当前“延迟筛选阈值”的普通可用节点；默认阈值为 `500ms`，已收藏节点不会因为后续测速失败被自动清理。
 5. 默认路由模式为“自动配置”，首次测速排序完成后会立即连接当前批次延迟最低的可用节点。
 
 ## 本修改版新增/调整功能
@@ -56,9 +57,11 @@ ml restart   # 重启服务
 - 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按自动配置连接最低延迟节点。
 - 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序。
 - 终端一键更新: 新增 `ml update` 命令，可在服务器终端从当前 GitHub 仓库拉取最新代码、重跑安装脚本并重启服务。
+- 节点活动日志: 新增 `ml node-log` 命令，持续跟踪当前活动节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
 - 新版本提示: Web UI 登录后会优先检测 GitHub 最新 Release tag，没有 Release 时检测最新 tag；只有仓库发布新 tag 时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
-- 高延迟触发刷新: 每 30 分钟检测当前已连接节点，只有延迟大于 `500ms` 才触发新一轮拉取、合并、测速、剔除。
-- 延迟过滤: 延迟大于 `500ms` 的普通节点会被剔除或标记不可用。
+- 高延迟触发刷新: 默认每 30 分钟检测当前已连接节点，只有延迟大于当前阈值才触发新一轮拉取、合并、测速、剔除。
+- 可调巡检策略: 在“代理设置”中可选择 5-60 分钟巡检间隔，以及 200-1000ms 延迟筛选阈值；修改后从保存时间重新计时，下次巡检生效。
+- 延迟过滤: 延迟大于当前阈值的普通节点会被剔除或标记不可用，默认阈值为 `500ms`。
 - 5 秒测速超时: 单个节点测速超过 `5s` 会判定超时，延迟显示 `-1`，普通超时节点会在测速排序后剔除。
 - 默认自动配置: 默认会在测速完成后选择最低延迟可用节点，适合首次部署后尽快获得可用出口。
 - 旧配置迁移: 如果旧版本保存的是固定 IP 模式但没有锁定具体节点，更新后会自动迁移为自动配置；已经锁定具体节点的固定 IP 配置不会被改动。
@@ -75,7 +78,7 @@ ml restart   # 重启服务
 
 ## 路由模式说明
 
-- 自动配置: 默认模式。首次测速、手动更新、模式切换或当前已连接节点延迟大于 `500ms` 时，会选择全局最低延迟可用节点。
+- 自动配置: 默认模式。首次测速、手动更新、模式切换或当前已连接节点延迟大于当前阈值时，会选择全局最低延迟可用节点。
 - 固定 IP: 锁定当前手动选择的节点，不会因为当前节点不可用而自动切换，但仍会定期测速并刷新候选节点列表。
 - 固定地区: 只在指定国家/地区和 IP 类型范围内测速排序，并选择最低延迟节点。
 - 固定收藏菜单: 只在收藏节点中测速排序并选择最低延迟节点；如果收藏节点全部不可用，是否回退到非收藏节点由收藏管理面板选项决定。
@@ -163,6 +166,7 @@ Useful commands:
 ```bash
 ml status
 ml logs
+ml node-log
 ml update
 ml restart
 ```
@@ -173,9 +177,11 @@ ml restart
 - First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
 - After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node is connected in automatic mode.
 - Added `ml update` for pulling the latest GitHub code, rerunning the installer, and restarting the service.
+- Added `ml node-log` for tailing persistent node activity logs, including active node IP, switch time, switch failures, threshold stalls, and background thread crashes.
 - Web UI checks the latest GitHub Release tag, falling back to the latest tag, and shows an update notice only when a new tag is published; ordinary commits do not trigger the notice.
 - Manual refresh merges old and new VPNGate candidates, then benchmarks and sorts them together.
-- Nodes above `500ms` are marked unavailable or pruned, while favorites are preserved.
+- Nodes above the configured latency threshold are marked unavailable or pruned, while favorites are preserved. The default threshold is `500ms`.
+- The active-node health-check interval and latency threshold are configurable in the proxy settings. Defaults are 30 minutes and `500ms`.
 - Per-node benchmark timeout is `5s`; timed-out regular nodes are shown as `-1` and pruned after sorting.
 - Default route mode is automatic configuration.
 - Legacy configs saved as fixed IP without a locked node are migrated to automatic configuration; fixed IP configs with a locked node are preserved.

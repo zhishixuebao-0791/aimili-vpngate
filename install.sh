@@ -190,6 +190,7 @@ import shutil
 
 INSTALL_DIR = "/opt/aimilivpn"
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
+NODE_ACTIVITY_LOG_FILE = "/opt/aimilivpn/vpngate_data/node_activity.log"
 LOGIN_REFRESH_REQUIRED_FILE = "/opt/aimilivpn/vpngate_data/login_refresh_required.json"
 
 def generate_random_password():
@@ -523,6 +524,17 @@ def show_logs():
             pass
     else:
         print(f"日志文件不存在: {LOG_FILE}")
+        time.sleep(2)
+
+def show_node_activity_logs():
+    print("Watching AimiliVPN node activity log (Ctrl+C to exit)...", flush=True)
+    if os.path.exists(NODE_ACTIVITY_LOG_FILE):
+        try:
+            subprocess.run(["tail", "-f", "-n", "80", NODE_ACTIVITY_LOG_FILE])
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(f"Node activity log file does not exist yet: {NODE_ACTIVITY_LOG_FILE}")
         time.sleep(2)
 
 def update_service():
@@ -874,6 +886,8 @@ def main():
                 print("\033[?1049l\033[?25h", end="", flush=True)
         elif cmd == "logs":
             show_logs()
+        elif cmd in ("node-log", "nodelog", "node_logs"):
+            show_node_activity_logs()
         elif cmd == "update":
             update_service()
         elif cmd == "uninstall":
@@ -885,7 +899,7 @@ def main():
         elif cmd == "password":
             configure_credentials()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password")
+            print("未知命令。可用命令: start, stop, restart, status, logs, node-log, update, uninstall, web, port, password")
         sys.exit(0)
         
     options = {
@@ -893,11 +907,12 @@ def main():
         '2': ("停止服务 (ml stop)", stop_service),
         '3': ("重启服务 (ml restart)", restart_service),
         '4': ("日志监控 (ml logs)", show_logs),
-        '5': ("网页配置 (ml web)", configure_web),
-        '6': ("端口配置 (ml port)", configure_port),
-        '7': ("账号密码 (ml password)", configure_credentials),
-        '8': ("一键更新 (ml update)", update_service),
-        '9': ("完全卸载 (ml uninstall)", uninstall_service),
+        '5': ("节点活动日志 (ml node-log)", show_node_activity_logs),
+        '6': ("网页配置 (ml web)", configure_web),
+        '7': ("端口配置 (ml port)", configure_port),
+        '8': ("账号密码 (ml password)", configure_credentials),
+        '9': ("一键更新 (ml update)", update_service),
+        'a': ("完全卸载 (ml uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
     
@@ -1196,6 +1211,7 @@ echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
+echo -e "  * 节点活动日志:   ${YELLOW}ml node-log${PLAIN}"
 echo -e "  * 一键更新版本:   ${YELLOW}ml update${PLAIN}"
 echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
