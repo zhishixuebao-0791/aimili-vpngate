@@ -528,6 +528,9 @@ def show_logs():
 
 def show_node_activity_logs():
     print("Watching AimiliVPN node activity log (Ctrl+C to exit)...", flush=True)
+    os.makedirs(os.path.dirname(NODE_ACTIVITY_LOG_FILE), exist_ok=True)
+    if not os.path.exists(NODE_ACTIVITY_LOG_FILE):
+        open(NODE_ACTIVITY_LOG_FILE, "a", encoding="utf-8").close()
     if os.path.exists(NODE_ACTIVITY_LOG_FILE):
         try:
             subprocess.run(["tail", "-f", "-n", "80", NODE_ACTIVITY_LOG_FILE])

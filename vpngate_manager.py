@@ -163,6 +163,10 @@ server_start_time = time.time()
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+    try:
+        NODE_ACTIVITY_LOG_FILE.touch(exist_ok=True)
+    except OSError:
+        pass
     if not AUTH_FILE.exists():
         AUTH_FILE.write_text(f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", encoding="utf-8")
         try:
@@ -378,6 +382,25 @@ def normalize_ip_value(value: Any) -> str:
 def node_ip_value(node: dict[str, Any]) -> str:
     return normalize_ip_value(node.get("ip")) or normalize_ip_value(node.get("remote_host"))
 
+def node_ip_values(node: dict[str, Any] | None) -> set[str]:
+    if not isinstance(node, dict):
+        return set()
+    values: set[str] = set()
+    for key in ("ip", "remote_host", "egress_ip", "proxy_ip", "blacklisted_ip"):
+        ip = normalize_ip_value(node.get(key))
+        if ip:
+            values.add(ip)
+    return values
+
+def manual_blacklist_match_for_node(node: dict[str, Any] | None, manual: dict[str, dict[str, Any]] | None = None) -> str:
+    if not isinstance(node, dict):
+        return ""
+    manual = manual if manual is not None else load_manual_blacklist()
+    for ip in node_ip_values(node):
+        if ip in manual:
+            return ip
+    return ""
+
 def load_manual_blacklist() -> dict[str, dict[str, Any]]:
     raw = read_json(MANUAL_BLACKLIST_FILE, {})
     if not isinstance(raw, dict):
@@ -425,8 +448,8 @@ def manual_blacklist_entries(search: str = "") -> list[dict[str, Any]]:
 
 def apply_manual_blacklist_to_node(node: dict[str, Any], manual: dict[str, dict[str, Any]] | None = None) -> bool:
     manual = manual if manual is not None else load_manual_blacklist()
-    ip = node_ip_value(node)
-    if ip and ip in manual:
+    ip = manual_blacklist_match_for_node(node, manual)
+    if ip:
         node["manual_blacklisted"] = True
         node["probe_status"] = "unavailable"
         node["probe_message"] = f"Manual blacklist: {ip}"
@@ -490,7 +513,7 @@ def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
         nodes = read_json(NODES_FILE, [])
         if isinstance(nodes, list):
             for node in nodes:
-                if not isinstance(node, dict) or node_ip_value(node) != normalized:
+                if not isinstance(node, dict) or normalized not in node_ip_values(node):
                     continue
                 latency = parse_int(node.get("latency_ms"))
                 if latency > 0 and latency <= latency_threshold:
@@ -518,12 +541,15 @@ def disconnect_active_if_manual_blacklisted(ip: str) -> bool:
     if not isinstance(nodes, list):
         return False
     active_node = next((node for node in nodes if isinstance(node, dict) and node.get("id") == active_openvpn_node_id), None)
-    if active_node and node_ip_value(active_node) == ip:
+    state_proxy_ip = normalize_ip_value(read_json(STATE_FILE, {}).get("proxy_ip"))
+    if (active_node and ip in node_ip_values(active_node)) or (state_proxy_ip and state_proxy_ip == ip):
         old_active_id = active_openvpn_node_id
         stop_active_openvpn()
         active_openvpn_node_id = ""
-        active_node["active"] = False
-        apply_manual_blacklist_to_node(active_node)
+        if active_node:
+            active_node["active"] = False
+            active_node["egress_ip"] = state_proxy_ip or active_node.get("egress_ip", "")
+            apply_manual_blacklist_to_node(active_node)
         write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", active_node_latency="无活动连接", last_check_message=f"手动拉黑当前节点 IP: {ip}")
         return bool(old_active_id)
@@ -1714,8 +1740,11 @@ def merge_nodes_preserve_old(old_nodes: list[dict[str, Any]], new_nodes: list[di
 
 def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep_ids: set[str] | None = None) -> list[dict[str, Any]]:
     keep_ids = keep_ids or set()
+    manual = load_manual_blacklist()
     kept: list[dict[str, Any]] = []
     for node in nodes:
+        if manual_blacklist_match_for_node(node, manual):
+            continue
         node_id = str(node.get("id") or "")
         if parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS and node_id not in favorite_ids and node_id not in keep_ids:
             continue
@@ -1764,7 +1793,7 @@ def remove_nodes_by_ips(ips: set[str]) -> list[str]:
             return []
         kept = []
         for node in nodes:
-            if isinstance(node, dict) and node_ip_value(node) in normalized:
+            if isinstance(node, dict) and node_ip_values(node).intersection(normalized):
                 removed.append(str(node.get("id") or ""))
                 continue
             kept.append(node)
@@ -1775,10 +1804,12 @@ def remove_nodes_by_ips(ips: set[str]) -> list[str]:
 def switch_to_best_current_available(reason: str, exclude_ids: set[str] | None = None) -> bool:
     exclude_ids = exclude_ids or set()
     nodes = read_nodes()
+    manual = load_manual_blacklist()
     candidates = [
         n for n in nodes
         if n.get("probe_status") == "available"
         and not n.get("manual_blacklisted")
+        and not manual_blacklist_match_for_node(n, manual)
         and str(n.get("id") or "") not in exclude_ids
         and node_passes_current_latency(n)
     ]
@@ -1798,19 +1829,22 @@ def enforce_active_not_manual_blacklisted() -> bool:
     nodes = read_json(NODES_FILE, [])
     if not isinstance(nodes, list):
         return False
-    active_node = next((n for n in nodes if isinstance(n, dict) and n.get("id") == active_openvpn_node_id), None)
-    if not active_node:
+    old_id = str(active_openvpn_node_id or "")
+    active_node = next((n for n in nodes if isinstance(n, dict) and n.get("id") == old_id), None)
+    state_proxy_ip = normalize_ip_value(read_json(STATE_FILE, {}).get("proxy_ip"))
+    ip = manual_blacklist_match_for_node(active_node, manual) if active_node else ""
+    if not ip and state_proxy_ip in manual:
+        ip = state_proxy_ip
+    if not ip:
         return False
-    ip = node_ip_value(active_node)
-    if not ip or ip not in manual:
-        return False
-    old_id = str(active_node.get("id") or "")
-    active_node["active"] = False
-    active_node["manual_blacklisted"] = True
-    active_node["blacklisted_ip"] = ip
-    active_node["probe_status"] = "unavailable"
-    active_node["probe_message"] = f"Active node is manually blacklisted: {ip}"
-    write_json(NODES_FILE, sort_all_nodes(nodes))
+    if active_node:
+        active_node["active"] = False
+        active_node["manual_blacklisted"] = True
+        active_node["blacklisted_ip"] = ip
+        active_node["egress_ip"] = state_proxy_ip or active_node.get("egress_ip", "")
+        active_node["probe_status"] = "unavailable"
+        active_node["probe_message"] = f"Active node is manually blacklisted: {ip}"
+        write_json(NODES_FILE, sort_all_nodes(nodes))
     stop_active_openvpn()
     active_openvpn_node_id = ""
     remove_nodes_by_ips({ip})
@@ -2034,8 +2068,14 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         latency = parse_int(active_result.get("latency_ms"))
         if not active_result.get("ok") and is_probe_timeout_message(active_result.get("error")):
             latency = NODE_TIMEOUT_LATENCY_MS
+        egress_ip = normalize_ip_value(active_result.get("ip"))
+        active_blacklisted_ip = egress_ip if egress_ip in manual else ""
         ok = bool(active_result.get("ok")) and latency > 0 and latency <= latency_threshold
+        if active_blacklisted_ip:
+            ok = False
         message = f"Active proxy egress latency ok: {latency} ms" if ok else active_result.get("error", f"Active proxy latency {latency} ms > {latency_threshold} ms")
+        if active_blacklisted_ip:
+            message = f"Manual blacklist egress IP: {active_blacklisted_ip}"
         result = {
             "id": node_id,
             "ip": node_info.get("ip") or node_info.get("remote_host") or "",
@@ -2055,6 +2095,9 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             "quality": node_info.get("quality", ""),
             "egress_ip": active_result.get("ip", ""),
         }
+        if active_blacklisted_ip:
+            result["manual_blacklisted"] = True
+            result["blacklisted_ip"] = active_blacklisted_ip
         mark_purity_disabled(result)
         return result
 
@@ -2150,8 +2193,14 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         "quality": "",
         "egress_ip": egress_ip,
     }
+    blacklisted_ip = manual_blacklist_match_for_node(result, manual)
+    if blacklisted_ip:
+        result["probe_status"] = "unavailable"
+        result["probe_message"] = f"Manual blacklist egress IP: {blacklisted_ip}"
+        result["manual_blacklisted"] = True
+        result["blacklisted_ip"] = blacklisted_ip
     mark_purity_disabled(result)
-    if ok:
+    if ok and not blacklisted_ip:
         vpn_utils.enrich_ip_info([result])
         # Purity scoring/filtering is intentionally disabled. Keep the old call
         # here commented for future rollback reference.
@@ -2263,10 +2312,13 @@ def country_matches(node: dict[str, Any], target_country: str) -> bool:
 def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any], exclude_active: bool = True) -> list[dict[str, Any]]:
     routing_mode = ui_cfg.get("routing_mode", "auto")
     target_country = ui_cfg.get("force_country", "")
+    manual = load_manual_blacklist()
     candidates = [
         n for n in nodes
         if n.get("probe_status") == "available"
+        and not manual_blacklist_match_for_node(n, manual)
         and (not exclude_active or not n.get("active"))
+        and node_passes_current_latency(n)
     ]
 
     if routing_mode == "fixed_region" and target_country:
@@ -2293,7 +2345,7 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
 
 def node_in_routing_test_scope(node: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    if node.get("manual_blacklisted"):
+    if node.get("manual_blacklisted") or manual_blacklist_match_for_node(node):
         return False
     if routing_mode == "auto":
         return True
@@ -2430,7 +2482,7 @@ def favorite_node_ids(ui_cfg: dict[str, Any]) -> list[str]:
 def node_can_be_favorited(node: dict[str, Any] | None) -> bool:
     if not node:
         return False
-    if node.get("manual_blacklisted"):
+    if node.get("manual_blacklisted") or manual_blacklist_match_for_node(node):
         return False
     return node.get("probe_status") == "available"
 
@@ -2445,7 +2497,9 @@ def cleanup_favorite_node_ids(nodes: list[dict[str, Any]] | None = None) -> list
     cleaned = [
         node_id
         for node_id in fav_ids
-        if node_map.get(node_id) is not None and not node_map[node_id].get("manual_blacklisted")
+        if node_map.get(node_id) is not None
+        and not node_map[node_id].get("manual_blacklisted")
+        and not manual_blacklist_match_for_node(node_map[node_id])
     ]
     if cleaned != fav_ids:
         ui_cfg["favorite_node_ids"] = cleaned
@@ -2782,12 +2836,46 @@ def connect_node(node_id: str) -> str:
             proxy_latency = parse_int(res.get("latency_ms"))
             if proxy_latency > 0:
                 last_active_latency = proxy_latency
+            proxy_ip = normalize_ip_value(res.get("ip"))
+            manual = load_manual_blacklist()
+            if proxy_ip and proxy_ip in manual:
+                with lock:
+                    active_openvpn_process = process
+                    active_openvpn_node_id = node_id
+                    current_nodes = read_nodes()
+                    for item in current_nodes:
+                        if item.get("id") == node_id:
+                            item["active"] = False
+                            item["egress_ip"] = proxy_ip
+                            item["manual_blacklisted"] = True
+                            item["blacklisted_ip"] = proxy_ip
+                            item["probe_status"] = "unavailable"
+                            item["probe_message"] = f"Manual blacklist egress IP: {proxy_ip}"
+                            break
+                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                stop_active_openvpn()
+                with lock:
+                    active_openvpn_node_id = ""
+                    active_openvpn_process = None
+                set_state(
+                    active_openvpn_node_id="",
+                    is_connecting=False,
+                    proxy_ok=False,
+                    proxy_ip=proxy_ip,
+                    proxy_latency_ms=proxy_latency,
+                    proxy_error=f"Manual blacklist egress IP: {proxy_ip}",
+                    active_node_latency="无活动连接",
+                    last_check_message=f"节点出口 IP 命中手动拉黑，已断开: {proxy_ip}",
+                )
+                log_node_activity("BLACKLIST_DISCONNECT", f"Connected node egress IP is manually blacklisted: {proxy_ip}", node)
+                raise RuntimeError(f"Node egress IP is manually blacklisted: {proxy_ip}")
             set_state(
                 proxy_ok=True,
                 proxy_ip=res["ip"],
                 proxy_latency_ms=proxy_latency,
                 proxy_error=""
             )
+            node["egress_ip"] = proxy_ip or res.get("ip", "")
         else:
             set_state(
                 proxy_ok=False,
@@ -2797,6 +2885,7 @@ def connect_node(node_id: str) -> str:
             )
             
         latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
+        write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         if old_node and old_node.get("id") != node_id:
             log_node_activity("SWITCH", f"Switched from {old_node.get('id')} to {node_id}", node)
@@ -6256,6 +6345,9 @@ def background_proxy_checker() -> None:
                     proxy_latency_ms=res["latency_ms"],
                     proxy_error=""
                 )
+                if enforce_active_not_manual_blacklisted():
+                    time.sleep(5)
+                    continue
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 error_msg = res.get("error", "未知错误")
@@ -6591,6 +6683,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
+            enforce_active_not_manual_blacklisted()
             nodes = read_nodes()
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:

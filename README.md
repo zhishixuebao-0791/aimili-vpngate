@@ -58,6 +58,9 @@ ml restart   # 重启服务
 - 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序。
 - 终端一键更新: 新增 `ml update` 命令，可在服务器终端从当前 GitHub 仓库拉取最新代码、重跑安装脚本并重启服务。
 - 节点活动日志: 新增 `ml node-log` 命令，持续跟踪当前活动节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
+  - 文件路径: `/opt/aimilivpn/vpngate_data/node_activity.log`
+  - 主服务日志: `/opt/aimilivpn/vpngate_data/vpngate.log`
+  - Web 日志面板 JSON: `/opt/aimilivpn/vpngate_data/logs/YYYY-MM-DD.json`
 - 新版本提示: Web UI 登录后会优先检测 GitHub 最新 Release tag，没有 Release 时检测最新 tag；只有仓库发布新 tag 时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
 - 高延迟触发刷新: 默认每 30 分钟检测当前已连接节点，只有延迟大于当前阈值才触发新一轮拉取、合并、测速、剔除。
 - 可调巡检策略: 在“代理设置”中可选择 5-60 分钟巡检间隔，以及 200-1000ms 延迟筛选阈值；修改后从保存时间重新计时，下次巡检生效。
