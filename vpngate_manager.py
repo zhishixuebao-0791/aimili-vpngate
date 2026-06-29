@@ -392,11 +392,21 @@ def node_ip_values(node: dict[str, Any] | None) -> set[str]:
             values.add(ip)
     return values
 
+def node_egress_ip_values(node: dict[str, Any] | None) -> set[str]:
+    if not isinstance(node, dict):
+        return set()
+    values: set[str] = set()
+    for key in ("egress_ip", "proxy_ip"):
+        ip = normalize_ip_value(node.get(key))
+        if ip:
+            values.add(ip)
+    return values
+
 def manual_blacklist_match_for_node(node: dict[str, Any] | None, manual: dict[str, dict[str, Any]] | None = None) -> str:
     if not isinstance(node, dict):
         return ""
     manual = manual if manual is not None else load_manual_blacklist()
-    for ip in node_ip_values(node):
+    for ip in node_egress_ip_values(node):
         if ip in manual:
             return ip
     return ""
@@ -455,8 +465,12 @@ def apply_manual_blacklist_to_node(node: dict[str, Any], manual: dict[str, dict[
         node["probe_message"] = f"Manual blacklist: {ip}"
         node["blacklisted_ip"] = ip
         return True
+    was_manual = bool(node.get("manual_blacklisted")) or str(node.get("probe_message") or "").startswith("Manual blacklist")
     node["manual_blacklisted"] = False
     node.pop("blacklisted_ip", None)
+    if was_manual and node_passes_current_latency(node):
+        node["probe_status"] = "available"
+        node["probe_message"] = "Manual blacklist entry IP ignored; egress IP is not blacklisted"
     return False
 
 def apply_manual_blacklist_to_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -473,7 +487,22 @@ def apply_manual_blacklist_to_storage() -> None:
         manual = load_manual_blacklist()
         changed = False
         for node in nodes:
-            if isinstance(node, dict) and apply_manual_blacklist_to_node(node, manual):
+            if not isinstance(node, dict):
+                continue
+            before = (
+                node.get("manual_blacklisted"),
+                node.get("blacklisted_ip"),
+                node.get("probe_status"),
+                node.get("probe_message"),
+            )
+            apply_manual_blacklist_to_node(node, manual)
+            after = (
+                node.get("manual_blacklisted"),
+                node.get("blacklisted_ip"),
+                node.get("probe_status"),
+                node.get("probe_message"),
+            )
+            if before != after:
                 changed = True
         if changed:
             write_json(NODES_FILE, nodes)
@@ -492,10 +521,45 @@ def add_manual_blacklist_ip(ip: str, reason: str = "manual blacklist") -> dict[s
     apply_manual_blacklist_to_storage()
     cleanup_favorite_node_ids()
     disconnected = disconnect_active_if_manual_blacklisted(normalized)
-    remove_nodes_by_ips({normalized})
     if disconnected:
-        switch_to_best_current_available(f"手动拉黑当前活动节点 IP: {normalized}", exclude_ids=set())
+        trigger_egress_blacklist_failover(f"Manual blacklist active egress IP: {normalized}", exclude_ids=set())
+        return data[normalized]
     return data[normalized]
+
+def resolve_node_egress_ip_for_blacklist(node_id: str) -> str:
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        raise ValueError("Node id is required")
+
+    nodes = read_nodes()
+    node = next((item for item in nodes if isinstance(item, dict) and str(item.get("id") or "") == node_id), None)
+    if not node:
+        raise ValueError(f"Node not found: {node_id}")
+
+    if node_id == active_openvpn_node_id and active_openvpn_running():
+        state_ip = normalize_ip_value(read_json(STATE_FILE, {}).get("proxy_ip"))
+        if state_ip:
+            return state_ip
+        health = check_proxy_health()
+        health_ip = normalize_ip_value(health.get("ip"))
+        if health.get("ok") and health_ip:
+            return health_ip
+
+    for ip in sorted(node_egress_ip_values(node)):
+        if ip:
+            return ip
+
+    tested = test_node_by_id(node_id)
+    for ip in sorted(node_egress_ip_values(tested)):
+        if ip:
+            return ip
+
+    raise ValueError("未检测到该节点真实出口 IP，请先点击检测后再拉黑")
+
+def add_manual_blacklist_node_egress(node_id: str, reason: str = "manual blacklist") -> dict[str, Any]:
+    egress_ip = resolve_node_egress_ip_for_blacklist(node_id)
+    entry = add_manual_blacklist_ip(egress_ip, reason or f"node {node_id} egress blacklist")
+    return {"node_id": str(node_id or "").strip(), "ip": egress_ip, "entry": entry}
 
 def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
     normalized = normalize_ip_value(ip)
@@ -513,7 +577,7 @@ def remove_manual_blacklist_ip(ip: str) -> dict[str, Any]:
         nodes = read_json(NODES_FILE, [])
         if isinstance(nodes, list):
             for node in nodes:
-                if not isinstance(node, dict) or normalized not in node_ip_values(node):
+                if not isinstance(node, dict) or normalized not in node_egress_ip_values(node):
                     continue
                 latency = parse_int(node.get("latency_ms"))
                 if latency > 0 and latency <= latency_threshold:
@@ -542,7 +606,8 @@ def disconnect_active_if_manual_blacklisted(ip: str) -> bool:
         return False
     active_node = next((node for node in nodes if isinstance(node, dict) and node.get("id") == active_openvpn_node_id), None)
     state_proxy_ip = normalize_ip_value(read_json(STATE_FILE, {}).get("proxy_ip"))
-    if (active_node and ip in node_ip_values(active_node)) or (state_proxy_ip and state_proxy_ip == ip):
+    active_egress_ips = node_egress_ip_values(active_node)
+    if (active_node and ip in active_egress_ips) or (state_proxy_ip and state_proxy_ip == ip):
         old_active_id = active_openvpn_node_id
         stop_active_openvpn()
         active_openvpn_node_id = ""
@@ -1793,13 +1858,98 @@ def remove_nodes_by_ips(ips: set[str]) -> list[str]:
             return []
         kept = []
         for node in nodes:
-            if isinstance(node, dict) and node_ip_values(node).intersection(normalized):
+            if isinstance(node, dict) and node_egress_ip_values(node).intersection(normalized):
                 removed.append(str(node.get("id") or ""))
                 continue
             kept.append(node)
         if removed:
             write_json(NODES_FILE, sort_all_nodes(kept))
     return removed
+
+def mark_node_connect_failed(node_id: str, message: str) -> None:
+    node_id = str(node_id or "")
+    if not node_id:
+        return
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        if not isinstance(nodes, list):
+            return
+        changed = False
+        for node in nodes:
+            if not isinstance(node, dict) or str(node.get("id") or "") != node_id:
+                continue
+            node["active"] = False
+            node["probe_status"] = "unavailable"
+            node["probe_message"] = message
+            changed = True
+            break
+        if changed:
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+
+def connect_first_available_candidate(
+    candidates: list[dict[str, Any]],
+    reason: str,
+    exclude_ids: set[str] | None = None,
+) -> tuple[bool, str]:
+    exclude_ids = exclude_ids or set()
+    manual = load_manual_blacklist()
+    seen: set[str] = set()
+    ordered: list[dict[str, Any]] = []
+    for node in candidates:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "")
+        if (
+            not node_id
+            or node_id in seen
+            or node_id in exclude_ids
+            or node.get("probe_status") != "available"
+            or node.get("manual_blacklisted")
+            or manual_blacklist_match_for_node(node, manual)
+            or not node_passes_current_latency(node)
+        ):
+            continue
+        ordered.append(node)
+        seen.add(node_id)
+
+    ordered.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, str(n.get("id") or "")))
+    if not ordered:
+        msg = f"{reason}; no switchable available candidate"
+        set_state(last_check_message=msg)
+        log_to_json("WARNING", "VPN", msg)
+        return False, msg
+
+    if is_connecting:
+        msg = f"{reason}; failover deferred because another connection or test is running"
+        set_state(last_check_message=msg)
+        log_to_json("WARNING", "VPN", msg)
+        return False, msg
+
+    failures: list[str] = []
+    for node in ordered:
+        node_id = str(node.get("id") or "")
+        if node_id == active_openvpn_node_id and active_openvpn_running():
+            msg = f"{reason}; active node already selected: {node_id}"
+            set_state(last_check_message=msg)
+            return True, msg
+        try:
+            connect_node(node_id)
+            msg = f"{reason}; switched to {node_id}"
+            set_state(last_check_message=msg)
+            return True, msg
+        except Exception as exc:
+            fail_msg = f"{node_id}: {exc}"
+            failures.append(fail_msg)
+            mark_node_connect_failed(node_id, str(exc))
+            log_to_json("WARNING", "VPN", f"{reason}; candidate failed; {fail_msg}")
+            continue
+
+    msg = f"{reason}; all {len(ordered)} candidates failed"
+    if failures:
+        msg = f"{msg}; last error: {failures[-1]}"
+    clear_active_connection_state(msg)
+    log_to_json("ERROR", "VPN", msg)
+    return False, msg
 
 def switch_to_best_current_available(reason: str, exclude_ids: set[str] | None = None) -> bool:
     exclude_ids = exclude_ids or set()
@@ -1817,9 +1967,22 @@ def switch_to_best_current_available(reason: str, exclude_ids: set[str] | None =
     if not candidates:
         set_state(last_check_message=f"{reason}; 当前列表没有可切换的非拉黑可用节点")
         return False
-    connect_node(candidates[0]["id"])
-    set_state(last_check_message=f"{reason}; 已切换到当前列表最低延迟节点 {candidates[0]['id']}")
-    return True
+    switched, _ = connect_first_available_candidate(candidates, reason, exclude_ids=exclude_ids)
+    return switched
+
+def trigger_egress_blacklist_failover(reason: str, exclude_ids: set[str] | None = None) -> None:
+    if maintenance_lock.locked():
+        switch_to_best_current_available(reason, exclude_ids=exclude_ids)
+        return
+
+    def run_refresh() -> None:
+        try:
+            refresh_test_prune_and_maybe_switch(reason)
+        except Exception as exc:
+            log_to_json("ERROR", "VPN", f"{reason}; refresh failover failed: {exc}")
+            switch_to_best_current_available(reason, exclude_ids=exclude_ids)
+
+    threading.Thread(target=run_refresh, daemon=True).start()
 
 def enforce_active_not_manual_blacklisted() -> bool:
     global active_openvpn_node_id
@@ -1848,8 +2011,12 @@ def enforce_active_not_manual_blacklisted() -> bool:
     stop_active_openvpn()
     active_openvpn_node_id = ""
     remove_nodes_by_ips({ip})
-    set_state(active_openvpn_node_id="", active_node_latency="无活动连接", last_check_message=f"当前活动节点命中拉黑 IP，已断开: {ip}")
-    switch_to_best_current_available(f"当前活动节点命中拉黑 IP: {ip}", exclude_ids={old_id})
+    set_state(
+        active_openvpn_node_id="",
+        active_node_latency="No active connection",
+        last_check_message=f"Active egress IP is manually blacklisted: {ip}",
+    )
+    trigger_egress_blacklist_failover(f"Active egress IP is manually blacklisted: {ip}", exclude_ids={old_id})
     return True
 
 active_test_indexes = set()
@@ -2039,29 +2206,6 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
     latency_threshold = get_latency_threshold_ms()
     probe_deadline = time.monotonic() + NODE_PROBE_TIMEOUT_SECONDS
     manual = load_manual_blacklist()
-    if apply_manual_blacklist_to_node(node_info, manual):
-        result = {
-            "id": node_id,
-            "ip": node_info.get("ip") or node_info.get("remote_host") or "",
-            "remote_host": node_info.get("remote_host") or node_info.get("ip") or "",
-            "remote_port": parse_int(node_info.get("remote_port")),
-            "host_name": node_info.get("host_name", ""),
-            "sessions": node_info.get("sessions", 0),
-            "latency_ms": parse_int(node_info.get("latency_ms")),
-            "probe_status": "unavailable",
-            "probe_message": node_info.get("probe_message") or "Manual blacklist",
-            "probed_at": time.time(),
-            "owner": node_info.get("owner", ""),
-            "asn": node_info.get("asn", ""),
-            "as_name": node_info.get("as_name", ""),
-            "location": node_info.get("location", ""),
-            "ip_type": node_info.get("ip_type", ""),
-            "quality": node_info.get("quality", ""),
-            "manual_blacklisted": True,
-            "blacklisted_ip": node_info.get("blacklisted_ip", ""),
-        }
-        mark_purity_disabled(result)
-        return result
 
     active_result = active_node_real_latency(node_id)
     if active_result is not None:
@@ -2109,6 +2253,7 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             "probe_status": "unavailable",
             "probe_message": "Missing OpenVPN config",
             "probed_at": time.time(),
+            "egress_ip": "",
         }
 
     temp_path = test_config_path(node_id)
@@ -2122,6 +2267,7 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             "probe_status": "unavailable",
             "probe_message": f"Failed to write configuration: {e}",
             "probed_at": time.time(),
+            "egress_ip": "",
         }
 
     tun_idx = None
@@ -2259,7 +2405,8 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
-                    "latency_ms": NODE_TIMEOUT_LATENCY_MS if timeout_error else 0
+                    "latency_ms": NODE_TIMEOUT_LATENCY_MS if timeout_error else 0,
+                    "egress_ip": "",
                 }
                 mark_purity_disabled(error_node)
                 updated_nodes_map[nid] = error_node
@@ -2445,15 +2592,8 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
             set_state(is_connecting=False, last_check_message=msg)
             return msg
 
-        next_node = candidates[0]
-        if next_node.get("id") == active_id and active_openvpn_running():
-            msg = f"路由模式 {routing_mode} 测速完成，当前节点已是最低延迟节点: {next_node.get('id')}"
-            set_state(is_connecting=False, last_check_message=msg)
-            return msg
-
         is_connecting = False
-        connect_node(next_node["id"])
-        msg = f"路由模式 {routing_mode} 测速完成，已切换到最低延迟节点: {next_node['id']}"
+        switched, msg = connect_first_available_candidate(candidates, f"routing mode {routing_mode} failover")
         set_state(last_check_message=msg)
         return msg
     except Exception as exc:
@@ -2461,7 +2601,7 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
         print(f"[路由切换] {msg}", flush=True)
         log_to_json("ERROR", "VPN", msg)
         set_state(last_check_message=msg)
-        raise
+        return msg
     finally:
         is_connecting = False
         maintenance_lock.release()
@@ -2579,17 +2719,11 @@ def auto_switch_node(attempt: int = 0) -> None:
         candidates = filter_routing_candidates(nodes, ui_cfg, exclude_active=True)
         
     if candidates:
-        next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
-        print(f"[自动切换] {msg}", flush=True)
+        msg = "Current connection failed; trying available failover candidates"
+        print(f"[auto switch] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
-        try:
-            connect_node(next_node["id"])
-        except Exception as e:
-            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
-            print(f"[自动切换] {err_msg}", flush=True)
-            log_to_json("WARNING", "VPN", err_msg)
-            auto_switch_node(attempt + 1)
+        connect_first_available_candidate(candidates, msg)
+        return
     else:
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         if routing_mode == "fixed_region" and target_country:
@@ -2714,10 +2848,8 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
             set_state(active_openvpn_node_id="", is_connecting=False, last_check_message=msg, active_node_latency="无活动连接")
             return msg
 
-        next_node = candidates[0]
         is_connecting = False
-        connect_node(next_node["id"])
-        msg = f"节点测速排序完成，已切换到最低延迟节点: {next_node['id']}"
+        switched, msg = connect_first_available_candidate(candidates, "refresh/test failover")
         set_state(last_check_message=msg)
         return msg
     except Exception as exc:
@@ -2725,7 +2857,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
         print(f"[高延迟刷新] {msg}", flush=True)
         log_to_json("ERROR", "VPN", msg)
         set_state(last_check_message=msg)
-        raise
+        return msg
     finally:
         is_connecting = False
         maintenance_lock.release()
@@ -2753,7 +2885,7 @@ def connect_node(node_id: str) -> str:
         old_node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None) if active_openvpn_node_id else None
         if apply_manual_blacklist_to_node(node):
             write_json(NODES_FILE, nodes)
-            raise RuntimeError(f"Node IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('ip') or node.get('remote_host')}")
+            raise RuntimeError(f"Node egress IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('egress_ip') or node.get('proxy_ip')}")
         if old_node and old_node.get("id") != node_id:
             log_node_activity("SWITCH_REQUEST", f"Switch requested from {old_node.get('id')} to {node_id}", node)
         else:
@@ -2877,12 +3009,30 @@ def connect_node(node_id: str) -> str:
             )
             node["egress_ip"] = proxy_ip or res.get("ip", "")
         else:
+            proxy_error = res.get("error", "proxy health check failed")
+            with lock:
+                current_nodes = read_nodes()
+                for item in current_nodes:
+                    if item.get("id") == node_id:
+                        item["active"] = False
+                        item["probe_status"] = "unavailable"
+                        item["probe_message"] = f"Proxy health check failed: {proxy_error}"
+                        break
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                active_openvpn_node_id = ""
+                active_openvpn_process = None
+            stop_process(process)
             set_state(
+                active_openvpn_node_id="",
+                is_connecting=False,
                 proxy_ok=False,
                 proxy_ip="-",
                 proxy_latency_ms=0,
-                proxy_error=res.get("error", "未知错误")
+                proxy_error=proxy_error,
+                active_node_latency="No active connection",
+                last_check_message=f"Proxy health check failed for {node_id}: {proxy_error}",
             )
+            raise RuntimeError(f"Proxy health check failed: {proxy_error}")
             
         latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
         write_json(NODES_FILE, nodes)
@@ -5070,7 +5220,7 @@ function render(){
         ? `<button class="test-btn" disabled style="color: var(--danger); border-color: rgba(244,63,94,0.4); opacity: 0.8; padding: 0 8px; height: 30px;">已拉黑</button>`
         : isFav
         ? `<button class="test-btn" disabled style="color: var(--text-secondary); border-color: var(--border-color); opacity: 0.45; padding: 0 8px; height: 30px; cursor:not-allowed;">拉黑</button>`
-        : `<button class="test-btn" style="color: var(--danger); border-color: rgba(244,63,94,0.35); padding: 0 8px; height: 30px;" onclick="blacklistNode('${esc(n.ip||n.remote_host)}', event)">拉黑</button>`;
+        : `<button class="test-btn" style="color: var(--danger); border-color: rgba(244,63,94,0.35); padding: 0 8px; height: 30px;" onclick="blacklistNode('${esc(n.id)}', event)">拉黑</button>`;
 
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -5176,10 +5326,11 @@ async function toggleFavorite(id, event) {
   }
 }
 
-async function blacklistNode(ip, event) {
+async function blacklistNode(nodeId, event) {
   if (event) event.stopPropagation();
-  const targetIp = String(ip || "").trim();
-  if (!targetIp) {
+  const targetNodeId = String(nodeId || "").trim();
+  const targetNode = nodes.find(n => n && n.id === targetNodeId);
+  if (!targetNode) {
     showBlacklistMessage("无法识别节点IP");
     return;
   }
@@ -5187,7 +5338,7 @@ async function blacklistNode(ip, event) {
     const response = await fetch("./api/manual_blacklist_add", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ip: targetIp})
+      body: JSON.stringify({node_id: targetNodeId})
     });
     const result = await response.json();
     if (!result.ok) {
@@ -7162,10 +7313,21 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/manual_blacklist_add":
             try:
                 payload = self.read_json_body()
-                ip = str(payload.get("ip") or "").strip()
                 reason = str(payload.get("reason") or "manual blacklist").strip()
-                entry = add_manual_blacklist_ip(ip, reason)
-                self.send_json({"ok": True, "entry": entry, "items": manual_blacklist_entries()})
+                node_id = str(payload.get("node_id") or "").strip()
+                if node_id:
+                    result = add_manual_blacklist_node_egress(node_id, reason)
+                    self.send_json({
+                        "ok": True,
+                        "entry": result["entry"],
+                        "node_id": result["node_id"],
+                        "ip": result["ip"],
+                        "items": manual_blacklist_entries(),
+                    })
+                else:
+                    ip = str(payload.get("ip") or "").strip()
+                    entry = add_manual_blacklist_ip(ip, reason)
+                    self.send_json({"ok": True, "entry": entry, "items": manual_blacklist_entries()})
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
