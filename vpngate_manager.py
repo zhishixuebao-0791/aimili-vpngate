@@ -1806,17 +1806,28 @@ def merge_nodes_preserve_old(old_nodes: list[dict[str, Any]], new_nodes: list[di
 def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep_ids: set[str] | None = None) -> list[dict[str, Any]]:
     keep_ids = keep_ids or set()
     manual = load_manual_blacklist()
+    threshold = get_latency_threshold_ms()
     kept: list[dict[str, Any]] = []
     for node in nodes:
-        if manual_blacklist_match_for_node(node, manual):
-            continue
         node_id = str(node.get("id") or "")
-        if parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS and node_id not in favorite_ids and node_id not in keep_ids:
+        latency = parse_int(node.get("latency_ms"))
+        protected = node_id in favorite_ids or node_id in keep_ids
+        if protected:
+            kept.append(node)
+            continue
+        if latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold:
+            continue
+        egress_blacklisted = bool(manual_blacklist_match_for_node(node, manual) or node.get("manual_blacklisted"))
+        if egress_blacklisted:
+            node["active"] = False
+            node["manual_blacklisted"] = True
+            node["probe_status"] = "unavailable"
+            node["probe_message"] = node.get("probe_message") or "Manual blacklist egress IP"
+            kept.append(node)
             continue
         if (
             node.get("probe_status") == "available"
-            or node_id in favorite_ids
-            or node_id in keep_ids
+            or node.get("probe_status") == "unavailable"
         ):
             kept.append(node)
     return sort_all_nodes(kept)
@@ -2010,7 +2021,6 @@ def enforce_active_not_manual_blacklisted() -> bool:
         write_json(NODES_FILE, sort_all_nodes(nodes))
     stop_active_openvpn()
     active_openvpn_node_id = ""
-    remove_nodes_by_ips({ip})
     set_state(
         active_openvpn_node_id="",
         active_node_latency="No active connection",
@@ -2370,9 +2380,6 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         if node:
             node.update({k: v for k, v in tested.items() if k != "id"})
             apply_manual_blacklist_to_node(node)
-            fav_ids = set(favorite_node_ids(load_ui_config()))
-            if parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS and node_id not in fav_ids:
-                nodes = [item for item in nodes if item.get("id") != node_id]
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             cleanup_favorite_node_ids(sorted_nodes)
