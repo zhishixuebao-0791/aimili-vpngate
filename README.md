@@ -21,9 +21,21 @@ Bilingual: [中文](#中文) | [English](#english)
 | 渠道 | 当前版本 | 获取方式 | 说明 |
 | --- | --- | --- | --- |
 | 稳定版 | **v1.26.6** | 一键部署命令 | 经过线上长期运行验证的版本 |
-| 发行版 | **v1.26.10** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
+| 发行版 | **v1.26.11** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
 
 Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版本号。
+
+### 更新日志
+
+- **v1.26.11**
+  - 不可用节点统一清理：除超时（-1）外，其他失败（显示 `-`）也计入连续失败并进入阶梯冷却（30 分钟 / 2 小时 / 6 小时 / 24 小时）；连续失败 4 次或已从 VPNGate 下线的节点自动移出列表，避免死节点无限堆积、拖慢测速。
+  - 节点数超过上限时优先丢弃不可用节点，保证新节点能进入列表。
+  - 已下线的拉黑节点从列表移除（拉黑 IP 清单本身不受影响）。
+  - 切换到固定 IP 模式时锁定当前连接的节点。
+  - 后台配置改为原子写入；配置文件读取异常时不再重置账号密码。
+  - 连接过程不再覆盖期间其他操作对节点的修改。
+- **v1.26.10**：修复固定 IP 模式重启后无法连接、断开连接误杀测速进程、“更新节点”断开健康节点等问题；新增版本号显示与稳定版/发行版双渠道。
+- **v1.26.6**：稳定版（0629_bug修复 + 版本号显示）。
 
 ## 一键部署
 
@@ -49,7 +61,7 @@ http://your_vps_ip:8787/随机安全后缀
 ml status    # 查看状态
 ml logs      # 查看实时日志
 ml node-log  # 查看节点切换与异常追踪日志
-ml update    # 更新到最新发行版（当前 v1.26.10）并重启服务
+ml update    # 更新到最新发行版（当前 v1.26.11）并重启服务
 ml restart   # 重启服务
 ```
 
@@ -180,7 +192,7 @@ Run as `root` on a fresh Linux VPS:
 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-Release channels: the one-click installer deploys the **stable** version (currently `v1.26.6`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.10`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
+Release channels: the one-click installer deploys the **stable** version (currently `v1.26.6`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.11`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
 
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 

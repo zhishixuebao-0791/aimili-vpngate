@@ -259,22 +259,34 @@ def load_ui_cfg():
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
     cfg = {"host": "::", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": ""}
     if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        # 服务进程可能正在写入，读取失败时短暂重试，避免拿到残缺配置后再写回覆盖用户设置
+        for _ in range(5):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
                 for k, v in data.items():
                     cfg[k] = v
-        except Exception:
-            pass
+                cfg.pop("_load_failed", None)
+                break
+            except Exception:
+                cfg["_load_failed"] = True
+                time.sleep(0.2)
     return cfg
 
 def save_ui_cfg(cfg):
     import json
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
+    if cfg.get("_load_failed"):
+        print("错误: 读取现有配置失败，为避免覆盖已有设置，本次未保存。请稍后重试。")
+        return False
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.ml{os.getpid()}.tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        # 原子写入：先写临时文件再替换，避免服务进程读到写了一半的文件；
+        # 临时文件名带进程号，避免与服务进程的 ui_auth.json.tmp 冲突
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
         return True
     except Exception:
         return False

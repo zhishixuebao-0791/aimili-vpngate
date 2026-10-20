@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.10"
+APP_VERSION = "1.26.11"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示以最高的 vX.Y.Z 标签（即发行版）为准
 STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
@@ -125,8 +125,10 @@ NODE_COOLDOWN_STEPS_SECONDS = [
     env_int("NODE_COOLDOWN_STEP3_SECONDS", 6 * 60 * 60, 1),
     env_int("NODE_COOLDOWN_STEP4_SECONDS", 24 * 60 * 60, 1),
 ]
-# 非收藏节点连续超时达到该次数后直接剔除，避免死节点无限堆积
+# 非收藏节点连续失败（超时或其他失败）达到该次数后直接剔除，避免死节点无限堆积
 NODE_TIMEOUT_MAX_FAILS = env_int("NODE_TIMEOUT_MAX_FAILS", len(NODE_COOLDOWN_STEPS_SECONDS), 1)
+# 节点列表上限，超出时优先丢弃不可用节点
+NODE_LIST_LIMIT = env_int("NODE_LIST_LIMIT", 1000, 50)
 LATENCY_CHECK_INTERVAL_CHOICES_MINUTES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
 LATENCY_THRESHOLD_CHOICES_MS = [200, 300, 400, 500, 600, 700, 800, 900, 1000]
 DEFAULT_LATENCY_CHECK_INTERVAL_MINUTES = 30
@@ -379,10 +381,11 @@ def read_json(path: Path, default: Any) -> Any:
             return default
 
 def save_ui_config(ui_cfg: dict[str, Any]) -> None:
+    # 原子写入（临时文件 + 替换），避免其他进程（如 ml）读到写了一半的配置
     auth_file = DATA_DIR / "ui_auth.json"
     with lock:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
-        auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(auth_file, ui_cfg)
 
 def normalize_ip_value(value: Any) -> str:
     ip = str(value or "").strip()
@@ -690,9 +693,26 @@ def load_ui_config() -> dict[str, Any]:
             "latency_policy_updated_at": 0,
         }
         updated = False
+        load_failed = False
         if auth_file.exists():
+            data = None
+            for attempt in range(5):
+                try:
+                    data = json.loads(auth_file.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("ui_auth.json 内容不是 JSON 对象")
+                    break
+                except Exception as exc:
+                    data = None
+                    if attempt == 4:
+                        print(f"[配置] 读取 ui_auth.json 失败，本次不改写配置以免重置账号密码: {exc}", flush=True)
+                    else:
+                        time.sleep(0.1)
+            if data is None:
+                # 文件存在但无法解析：绝不能用默认值/随机账号密码覆盖它
+                load_failed = True
+                data = {}
             try:
-                data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
                 for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "latency_check_interval_minutes", "latency_threshold_ms", "latency_policy_updated_at"]:
@@ -709,10 +729,14 @@ def load_ui_config() -> dict[str, Any]:
             except Exception:
                 pass
         
+        if load_failed:
+            # 返回默认配置但不生成、不写回凭据；密码为空时后台会拒绝登录，等文件恢复后自动正常
+            return config
+
         if not config.get("username"):
             config["username"] = generate_random_username()
             updated = True
-            
+
         if not config.get("password"):
             config["password"] = generate_random_password()
             updated = True
@@ -749,7 +773,7 @@ def load_ui_config() -> dict[str, Any]:
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
-                auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                write_json(auth_file, config)
             except Exception:
                 pass
                 
@@ -1833,11 +1857,15 @@ def merge_nodes_preserve_old(old_nodes: list[dict[str, Any]], new_nodes: list[di
         seen_ids.add(node_id)
     return merged
 
-def timeout_node_should_be_dropped(node: dict[str, Any], fresh_ids: set[str] | None = None) -> bool:
-    """超时节点是否应剔除：连续超时次数耗尽，或已不在 VPNGate 最新列表中（已下线）。"""
+def node_delisted(node: dict[str, Any], fresh_ids: set[str] | None) -> bool:
+    """节点已不在 VPNGate 最新拉取的列表中（已下线）。fresh_ids 为 None 表示本轮未拉取，无法判断。"""
+    return fresh_ids is not None and str(node.get("id") or "") not in fresh_ids
+
+def failed_node_should_be_dropped(node: dict[str, Any], fresh_ids: set[str] | None = None) -> bool:
+    """不可用节点（超时或其他失败）是否应剔除：连续失败次数耗尽，或已从 VPNGate 下线。"""
     if parse_int(node.get("timeout_fail_count")) >= NODE_TIMEOUT_MAX_FAILS:
         return True
-    return fresh_ids is not None and str(node.get("id") or "") not in fresh_ids
+    return node_delisted(node, fresh_ids)
 
 def prune_failed_nodes(
     nodes: list[dict[str, Any]],
@@ -1856,29 +1884,57 @@ def prune_failed_nodes(
         if protected:
             kept.append(node)
             continue
-        if latency == NODE_TIMEOUT_LATENCY_MS:
-            if not node.get("cooldown_until"):
-                mark_node_timeout_cooldown(node, node, node.get("probe_message") or "Node probe timeout")
-            if timeout_node_should_be_dropped(node, fresh_ids):
-                continue
-            kept.append(node)
-            continue
         if latency > threshold:
             continue
         egress_blacklisted = bool(manual_blacklist_match_for_node(node, manual) or node.get("manual_blacklisted"))
         if egress_blacklisted:
+            # 拉黑节点保留以持续显示不可用；VPNGate 已下线的直接剔除（拉黑 IP 清单本身不受影响）
+            if node_delisted(node, fresh_ids):
+                continue
             node["active"] = False
             node["manual_blacklisted"] = True
             node["probe_status"] = "unavailable"
             node["probe_message"] = node.get("probe_message") or "Manual blacklist egress IP"
             kept.append(node)
             continue
-        if (
-            node.get("probe_status") == "available"
-            or node.get("probe_status") == "unavailable"
-        ):
+        status = node.get("probe_status")
+        if status == "unavailable":
+            # 超时（-1）与非超时失败（-）统一处理：进入阶梯冷却，连续失败次数耗尽或已下线时剔除
+            if not node.get("cooldown_until"):
+                mark_node_failure_cooldown(
+                    node,
+                    node,
+                    node.get("probe_message") or "Node probe failed",
+                    timeout=latency == NODE_TIMEOUT_LATENCY_MS,
+                )
+            if failed_node_should_be_dropped(node, fresh_ids):
+                continue
+            kept.append(node)
+            continue
+        if status == "available":
             kept.append(node)
     return sort_all_nodes(kept)
+
+def cap_node_list(nodes: list[dict[str, Any]], protect_ids: set[str], limit: int = NODE_LIST_LIMIT) -> list[dict[str, Any]]:
+    """节点数超过上限时按优先级截断：受保护 > 可用 > 待测新节点 > 不可用，避免死节点挤掉新节点。"""
+    if len(nodes) <= limit:
+        return nodes
+
+    def rank(node: dict[str, Any]) -> int:
+        if str(node.get("id") or "") in protect_ids:
+            return 0
+        status = node.get("probe_status")
+        if status == "available":
+            return 1
+        if status in ("not_checked", "testing"):
+            return 2
+        return 3
+
+    keep_ids = {
+        id(node)
+        for _, node in sorted(enumerate(nodes), key=lambda item: (rank(item[1]), item[0]))[:limit]
+    }
+    return [node for node in nodes if id(node) in keep_ids]
 
 def node_passes_current_latency(node: dict[str, Any] | None) -> bool:
     if not node:
@@ -1892,7 +1948,7 @@ def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool
         return False
     threshold = get_latency_threshold_ms()
     latency = parse_int(node.get("latency_ms"))
-    return latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold
+    return latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold or node.get("probe_status") == "unavailable"
 
 def node_cooldown_seconds(fail_count: int) -> int:
     count = max(1, fail_count)
@@ -1905,20 +1961,55 @@ def node_cooldown_active(node: dict[str, Any] | None, now: float | None = None) 
     now = time.time() if now is None else now
     return float(node.get("cooldown_until", 0) or 0) > now
 
-def mark_node_timeout_cooldown(target: dict[str, Any], source: dict[str, Any] | None = None, message: str = "") -> None:
+COOLDOWN_MESSAGE_MARKER = "; cooldown retry after "
+
+def mark_node_failure_cooldown(
+    target: dict[str, Any],
+    source: dict[str, Any] | None = None,
+    message: str = "",
+    timeout: bool = False,
+) -> None:
+    """记录一次测速/连接失败：连续失败次数 +1 并进入阶梯冷却，冷却期内不再重测。
+
+    计数沿用 timeout_fail_count 字段名（兼容已部署的 nodes.json），含义为“连续失败次数”，
+    超时与非超时失败都会累加。超时失败的延迟记为 -1，非超时失败保留原延迟值。
+    """
     source = source if isinstance(source, dict) else target
     now = time.time()
     fail_count = parse_int(source.get("timeout_fail_count")) + 1
     cooldown_until = now + node_cooldown_seconds(fail_count)
+    reason = str(message or target.get("probe_message") or ("Node probe timeout" if timeout else "Node probe failed"))
+    reason = reason.split(COOLDOWN_MESSAGE_MARKER)[0]
     target["timeout_fail_count"] = fail_count
     target["last_timeout_at"] = now
     target["cooldown_until"] = cooldown_until
-    target["cooldown_reason"] = message or target.get("probe_message") or "Node probe timeout"
+    target["cooldown_reason"] = reason
     target["probe_status"] = "unavailable"
-    target["latency_ms"] = NODE_TIMEOUT_LATENCY_MS
+    if timeout:
+        target["latency_ms"] = NODE_TIMEOUT_LATENCY_MS
     target["probe_message"] = (
-        f"{target['cooldown_reason']}; cooldown retry after "
+        f"{reason}{COOLDOWN_MESSAGE_MARKER}"
         f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cooldown_until))}"
+    )
+
+def mark_node_timeout_cooldown(target: dict[str, Any], source: dict[str, Any] | None = None, message: str = "") -> None:
+    mark_node_failure_cooldown(target, source, message, timeout=True)
+
+def settle_probe_failure_count(result: dict[str, Any], source: dict[str, Any] | None, latency_threshold: int) -> None:
+    """测速结果落定后更新连续失败计数：可用、测得超阈值延迟或命中拉黑时清零；其余失败计入冷却。"""
+    latency = parse_int(result.get("latency_ms"))
+    if (
+        result.get("probe_status") == "available"
+        or latency > latency_threshold
+        or result.get("manual_blacklisted")
+    ):
+        clear_node_timeout_cooldown(result)
+        return
+    mark_node_failure_cooldown(
+        result,
+        source,
+        str(result.get("probe_message") or ""),
+        timeout=latency == NODE_TIMEOUT_LATENCY_MS,
     )
 
 def clear_node_timeout_cooldown(node: dict[str, Any]) -> None:
@@ -1971,11 +2062,7 @@ def mark_node_connect_failed(node_id: str, message: str) -> None:
             if not isinstance(node, dict) or str(node.get("id") or "") != node_id:
                 continue
             node["active"] = False
-            if is_probe_timeout_message(message):
-                mark_node_timeout_cooldown(node, node, message)
-            else:
-                node["probe_status"] = "unavailable"
-                node["probe_message"] = message
+            mark_node_failure_cooldown(node, node, message, timeout=is_probe_timeout_message(message))
             changed = True
             break
         if changed:
@@ -2338,13 +2425,13 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         if active_blacklisted_ip:
             result["manual_blacklisted"] = True
             result["blacklisted_ip"] = active_blacklisted_ip
-        clear_node_timeout_cooldown(result)
+        settle_probe_failure_count(result, node_info, latency_threshold)
         mark_purity_disabled(result)
         return result
 
     config_text = node_info.get("config_text") or ""
     if not config_text:
-        return {
+        missing_result = {
             "id": node_id,
             "latency_ms": 0,
             "probe_status": "unavailable",
@@ -2352,6 +2439,8 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
             "probed_at": time.time(),
             "egress_ip": "",
         }
+        settle_probe_failure_count(missing_result, node_info, latency_threshold)
+        return missing_result
 
     temp_path = test_config_path(node_id)
     try:
@@ -2442,10 +2531,14 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         result["probe_message"] = f"Manual blacklist egress IP: {blacklisted_ip}"
         result["manual_blacklisted"] = True
         result["blacklisted_ip"] = blacklisted_ip
-    clear_node_timeout_cooldown(result)
+    settle_probe_failure_count(result, node_info, latency_threshold)
     mark_purity_disabled(result)
     if ok and not blacklisted_ip:
-        vpn_utils.enrich_ip_info([result])
+        # IP 信息补充失败不能影响测速结论，否则测速成功的节点会被误判为失败并计入冷却
+        try:
+            vpn_utils.enrich_ip_info([result])
+        except Exception as exc:
+            print(f"[测速] 补充 IP 信息失败（不影响测速结果）: {exc}", flush=True)
         # Purity scoring/filtering is intentionally disabled. Keep the old call
         # here commented for future rollback reference.
         # if purity_check:
@@ -2504,10 +2597,7 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
                     "latency_ms": NODE_TIMEOUT_LATENCY_MS if timeout_error else 0,
                     "egress_ip": "",
                 }
-                if timeout_error:
-                    mark_node_timeout_cooldown(error_node, to_test_by_id.get(nid), str(e))
-                else:
-                    clear_node_timeout_cooldown(error_node)
+                mark_node_failure_cooldown(error_node, to_test_by_id.get(nid), str(e), timeout=timeout_error)
                 mark_purity_disabled(error_node)
                 updated_nodes_map[nid] = error_node
                 
@@ -2652,15 +2742,17 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
                 keep_ids.add(active_id)
             if routing_mode == "fixed_ip" and ui_cfg.get("fixed_node_id"):
                 keep_ids.add(str(ui_cfg.get("fixed_node_id")))
-            # 与 prune_failed_nodes 保持一致：超时节点进入阶梯冷却保留，仅连续超时次数耗尽才剔除
+            # 与 prune_failed_nodes 保持一致：不可用节点（超时或其他失败）进入阶梯冷却保留，
+            # 仅连续失败次数耗尽才剔除；拉黑节点保留以持续显示不可用
             tested_nodes = [
                 node for node in tested_nodes
                 if not (
                     str(node.get("id") or "") in scope_ids
-                    and parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS
+                    and node.get("probe_status") == "unavailable"
+                    and not node.get("manual_blacklisted")
                     and str(node.get("id") or "") not in fav_ids
                     and str(node.get("id") or "") not in keep_ids
-                    and timeout_node_should_be_dropped(node)
+                    and failed_node_should_be_dropped(node)
                 )
             ]
             write_json(NODES_FILE, sort_all_nodes(tested_nodes))
@@ -2738,11 +2830,13 @@ def cleanup_favorite_node_ids(nodes: list[dict[str, Any]] | None = None) -> list
         and not manual_blacklist_match_for_node(node_map[node_id])
     ]
     if cleaned != fav_ids:
-        ui_cfg["favorite_node_ids"] = cleaned
-        auth_file = DATA_DIR / "ui_auth.json"
+        removed = set(fav_ids) - set(cleaned)
         with lock:
-            DATA_DIR.mkdir(exist_ok=True, parents=True)
-            auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 锁内重新读取并只修改收藏字段，避免用旧配置覆盖用户刚保存的其他设置
+            latest_cfg = load_ui_config()
+            latest_cfg["favorite_node_ids"] = [i for i in favorite_node_ids(latest_cfg) if i not in removed]
+            save_ui_config(latest_cfg)
+            cleaned = latest_cfg["favorite_node_ids"]
     return cleaned
 
 def auto_switch_node(attempt: int = 0) -> None:
@@ -2831,8 +2925,12 @@ def refresh_test_prune_and_maybe_switch(
         merged = merge_nodes_preserve_old(old_nodes, new_nodes)
 
         with lock:
-            if len(merged) > 1000:
-                merged = merged[:1000]
+            protect_ids = set(fav_ids)
+            if active_id:
+                protect_ids.add(active_id)
+            if ui_cfg.get("fixed_node_id"):
+                protect_ids.add(str(ui_cfg.get("fixed_node_id")))
+            merged = cap_node_list(merged, protect_ids)
             for n in merged:
                 node_id = str(n.get("id") or "")
                 if node_id and node_id not in old_by_id:
@@ -2956,6 +3054,22 @@ def refresh_test_prune_and_maybe_switch(
         is_connecting = False
         maintenance_lock.release()
 
+def update_node_flags_locked(node_id: str, active: bool, **fields: Any) -> None:
+    """在锁内重新读取节点列表，只更新目标节点字段与全局 active 标记后写回。
+
+    connect_node 耗时较长，不能把开始时读到的旧列表整体写回，否则会覆盖期间其他线程
+    （手动检测、拉黑、测速）对节点的修改。active=True 时其余节点置为非活动。
+    """
+    with lock:
+        current_nodes = read_nodes()
+        for item in current_nodes:
+            if item.get("id") == node_id:
+                item["active"] = active
+                item.update(fields)
+            elif active or item.get("active"):
+                item["active"] = False
+        write_json(NODES_FILE, current_nodes)
+
 def connect_node(node_id: str) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     node_id = str(node_id or "").strip()
@@ -2985,14 +3099,13 @@ def connect_node(node_id: str) -> str:
         else:
             log_node_activity("CONNECT_REQUEST", f"Connect requested for {node_id}", node)
         
-        ui_cfg = load_ui_config()
-        ui_cfg["connection_enabled"] = True
-        if ui_cfg.get("routing_mode") == "fixed_ip":
-            ui_cfg["fixed_node_id"] = node_id
-        auth_file = DATA_DIR / "ui_auth.json"
         with lock:
-            DATA_DIR.mkdir(exist_ok=True, parents=True)
-            auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 锁内读-改-写，只修改连接相关字段
+            ui_cfg = load_ui_config()
+            ui_cfg["connection_enabled"] = True
+            if ui_cfg.get("routing_mode") == "fixed_ip":
+                ui_cfg["fixed_node_id"] = node_id
+            save_ui_config(ui_cfg)
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
         stop_active_openvpn()
@@ -3017,9 +3130,7 @@ def connect_node(node_id: str) -> str:
             node["probe_status"] = "unavailable"
             node["probe_message"] = message
             log_node_activity("SWITCH_FAILED", f"OpenVPN failed while connecting {node_id}: {message}", node)
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
+            update_node_flags_locked(node_id, active=False, probe_status="unavailable", probe_message=message)
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
             set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
@@ -3049,12 +3160,8 @@ def connect_node(node_id: str) -> str:
         except Exception:
             pass
             
-        for item in nodes:
-            item["active"] = item.get("id") == node_id
-            if item["active"]:
-                _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-                item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
-        write_json(NODES_FILE, nodes)
+        _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
+        update_node_flags_locked(node_id, active=True, probe_message=f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}")
         
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
@@ -3129,7 +3236,7 @@ def connect_node(node_id: str) -> str:
             raise RuntimeError(f"Proxy health check failed: {proxy_error}")
             
         latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
-        write_json(NODES_FILE, nodes)
+        update_node_flags_locked(node_id, active=True, egress_ip=node.get("egress_ip", ""))
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         if old_node and old_node.get("id") != node_id:
             log_node_activity("SWITCH", f"Switched from {old_node.get('id')} to {node_id}", node)
@@ -3155,6 +3262,11 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock:
             is_connecting = False
+
+def lock_current_node_for_fixed_ip(ui_cfg: dict[str, Any], routing_mode: str) -> None:
+    """切换到固定 IP 模式时锁定当前连接的节点，避免沿用上次固定 IP 会话遗留的旧 fixed_node_id。"""
+    if routing_mode == "fixed_ip" and active_openvpn_node_id and active_openvpn_running():
+        ui_cfg["fixed_node_id"] = active_openvpn_node_id
 
 def reconnect_fixed_ip_node(reason: str) -> bool:
     """固定 IP 模式下没有活动连接时重新拉起 fixed_node_id。返回 False 表示需要稍后重试。"""
@@ -7003,7 +7115,7 @@ class Handler(BaseHTTPRequestHandler):
                 reauth_required = new_username != expected_username or (new_password and new_password != expected_password)
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    save_ui_config(ui_cfg)
                     if reauth_required:
                         active_sessions.clear()
                 
@@ -7074,6 +7186,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ui_cfg["proxy_port"] = new_proxy_port_int
                 ui_cfg["routing_mode"] = routing_mode
+                lock_current_node_for_fixed_ip(ui_cfg, routing_mode)
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["latency_check_interval_minutes"] = latency_check_interval
@@ -7084,7 +7197,7 @@ class Handler(BaseHTTPRequestHandler):
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    save_ui_config(ui_cfg)
                 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
@@ -7143,11 +7256,12 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 ui_cfg.pop("enable_force_country", None)
+                lock_current_node_for_fixed_ip(ui_cfg, routing_mode)
                 
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    save_ui_config(ui_cfg)
                 
                 self.send_json({"ok": True, "message": "出站路由配置更新成功，已即时生效！"})
                 next_route = (routing_mode, force_country, routing_ip_type, fav_fail_fallback)
@@ -7264,7 +7378,7 @@ class Handler(BaseHTTPRequestHandler):
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    save_ui_config(ui_cfg)
                 
                 stop_active_openvpn()
                 with lock:
