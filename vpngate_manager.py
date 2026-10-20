@@ -106,6 +106,8 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
         return default
     return parsed
 
+# 发行版本号（稳定版）
+APP_VERSION = "1.26.6"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
@@ -3598,6 +3600,18 @@ INDEX_HTML = r"""<!doctype html>
       gap: 8px;
     }
 
+    .app-version {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(129, 140, 248, 0.45);
+      background: rgba(99, 102, 241, 0.15);
+      color: #c7d2fe;
+      -webkit-text-fill-color: #c7d2fe;
+    }
+
     .status {
       font-size: 13px;
       color: var(--text-secondary);
@@ -4337,6 +4351,7 @@ INDEX_HTML = r"""<!doctype html>
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
       AimiliVPN 节点管理系统
+      <span class="app-version" title="当前版本">__APP_VERSION__</span>
     </h1>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -6837,7 +6852,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
                 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION).encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
