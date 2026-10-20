@@ -57,6 +57,63 @@ GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
+# 4. Clone or pull the repository
+INSTALL_DIR="/opt/aimilivpn"
+# 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
+DEFAULT_DEPLOY_BRANCH="main"
+
+# 版本渠道说明：
+#   稳定版 (STABLE_TAG)：一键部署命令安装的版本。稳定版升级时只需修改此处并推送 main。
+#   发行版 (最高的 vX.Y.Z 标签)：ml update 更新到的版本。
+STABLE_TAG="v1.26.6"
+
+# 自动检测本地已安装版本当前所在的分支
+CURRENT_BRANCH=""
+if [ -d "${INSTALL_DIR}/.git" ]; then
+    CURRENT_BRANCH=$(cd "${INSTALL_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+fi
+if [ "${CURRENT_BRANCH}" = "HEAD" ]; then
+    CURRENT_BRANCH=""
+fi
+DEPLOY_BRANCH="${CURRENT_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
+
+# 从安装目录本地运行（ml update 拉取代码后调用，包括旧版 ml）时，源码版本已由调用方切换好，
+# 不能再切回稳定版；只有一键部署（从网络下载运行）才切换源码版本
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+LOCAL_RERUN=0
+if [ "${SELF_PATH}" = "${INSTALL_DIR}/install.sh" ]; then
+    LOCAL_RERUN=1
+fi
+
+# 版本号比较：$1 > $2 时返回 0（支持 1.26.10 / v1.26.10 写法）
+version_gt() {
+    python3 - "$1" "$2" <<'PYEOF'
+import re, sys
+def key(v):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", v.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+a, b = key(sys.argv[1]), key(sys.argv[2])
+sys.exit(0 if a is not None and b is not None and a > b else 1)
+PYEOF
+}
+
+# 读取已安装代码中的 APP_VERSION（旧版本没有该常量时输出空）
+installed_version() {
+    sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' "${INSTALL_DIR}/vpngate_manager.py" 2>/dev/null | head -n 1 || true
+}
+
+# 一键部署的目标：AIMILI_DEPLOY_REF（手动指定）> 稳定版标签 STABLE_TAG
+checkout_deploy_target() {
+    local target="${AIMILI_DEPLOY_REF:-${STABLE_TAG}}"
+    if ! git -C "${INSTALL_DIR}" rev-parse --verify --quiet "${target}^{commit}" >/dev/null; then
+        echo -e "${RED}  -> 错误: 找不到部署目标 ${target}，请检查网络或标签是否已推送到远程仓库！${PLAIN}"
+        exit 1
+    fi
+    echo -e "  -> 正在切换源码至部署目标: ${target} ..."
+    git -C "${INSTALL_DIR}" reset --hard "${target}"
+    echo -e "${GREEN}  -> 源码已切换至 ${target}${PLAIN}"
+}
+
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
 if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
@@ -80,54 +137,44 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
 fi
 
-# 4. Clone or pull the repository
-INSTALL_DIR="/opt/aimilivpn"
-# 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
-DEFAULT_DEPLOY_BRANCH="main"
-
-# 自动检测本地已安装版本当前所在的分支
-CURRENT_BRANCH=""
-if [ -d "${INSTALL_DIR}/.git" ]; then
-    CURRENT_BRANCH=$(cd "${INSTALL_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
-fi
-DEPLOY_BRANCH="${CURRENT_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
-
-echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH})...${PLAIN}"
+echo -e "\n${YELLOW}[2/4] 正在部署源代码到 ${INSTALL_DIR} ...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
-else
-    if [ -d "${INSTALL_DIR}" ]; then
-        echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
-        cd "${INSTALL_DIR}"
-        git fetch --all || true
-        git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
-        echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
-        if git reset --hard "origin/${DEPLOY_BRANCH}"; then
-            echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-        else
-            if git pull origin "${DEPLOY_BRANCH}"; then
-                echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-            else
-                echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
-            fi
-        fi
+elif [ "${LOCAL_RERUN}" = "1" ] && [ -z "${AIMILI_DEPLOY_REF:-}" ]; then
+    echo -e "${GREEN}  -> 由安装目录本地运行（如 ml update），保持当前源码版本 $(installed_version)，仅重新配置服务。${PLAIN}"
+elif [ -d "${INSTALL_DIR}/.git" ]; then
+    echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在拉取远程更新与版本标签..."
+    cd "${INSTALL_DIR}"
+    git fetch --all --tags --force || true
+    git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
+    CURRENT_VERSION="$(installed_version)"
+    if [ -z "${AIMILI_DEPLOY_REF:-}" ] && [ -n "${CURRENT_VERSION}" ] && version_gt "${CURRENT_VERSION}" "${STABLE_TAG}"; then
+        echo -e "${GREEN}  -> 当前已安装 ${CURRENT_VERSION}，高于稳定版 ${STABLE_TAG#v}，保留当前版本（如需降级请设置 AIMILI_DEPLOY_REF=${STABLE_TAG}）。${PLAIN}"
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (分支: ${DEPLOY_BRANCH}) ..."
-        if git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        checkout_deploy_target
+    fi
+elif [ -d "${INSTALL_DIR}" ] && [ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]; then
+    echo -e "${RED}  -> 错误: ${INSTALL_DIR} 已存在但不是 Git 仓库，请备份后删除该目录再重新安装！${PLAIN}"
+    exit 1
+else
+    echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (分支: ${DEPLOY_BRANCH}) ..."
+    if git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
+    else
+        echo -e "  -> 尝试默认克隆..."
+        if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+            cd "${INSTALL_DIR}"
+            git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
             echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
         else
-            echo -e "  -> 尝试默认克隆..."
-            if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
-                cd "${INSTALL_DIR}"
-                git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
-                echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
-            else
-                echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
-                exit 1
-            fi
+            echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
+            exit 1
         fi
     fi
+    cd "${INSTALL_DIR}"
+    checkout_deploy_target
 fi
+echo -e "${GREEN}  -> 当前部署版本: $(installed_version)${PLAIN}"
 
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
@@ -423,7 +470,7 @@ def print_status():
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print_line("=======================================================")
-    print_line(f"               {bold}AimiliVPN 管理终端 v2.0{reset}                  ")
+    print_line(f"            {bold}AimiliVPN 管理终端 v{installed_app_version()}{reset}                ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
     print_line(format_line(f"代理网关 (Port {proxy_port})", gateway_status))
@@ -540,6 +587,35 @@ def show_node_activity_logs():
         print(f"Node activity log file does not exist yet: {NODE_ACTIVITY_LOG_FILE}")
         time.sleep(2)
 
+def latest_release_tag():
+    """返回本地仓库中最新的发行版标签 vX.Y.Z（按版本号比较，排除 V2026.06.16 等旧日期标签）。"""
+    import re
+    res = subprocess.run(["git", "-C", INSTALL_DIR, "tag", "-l"], capture_output=True, text=True)
+    best = None
+    for tag in res.stdout.split():
+        m = re.fullmatch(r"v(\d{1,3})\.(\d+)\.(\d+)", tag)
+        if m:
+            key = tuple(int(x) for x in m.groups())
+            if best is None or key > best[0]:
+                best = (key, tag)
+    return best[1] if best else ""
+
+def installed_app_version():
+    """读取已安装代码的版本号：优先 APP_VERSION 常量，其次当前提交上的 vX.Y.Z 标签，都没有时返回“未知版本”。"""
+    import re
+    try:
+        with open(os.path.join(INSTALL_DIR, "vpngate_manager.py"), encoding="utf-8") as f:
+            m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    res = subprocess.run(["git", "-C", INSTALL_DIR, "describe", "--tags", "--exact-match"], capture_output=True, text=True)
+    tag = res.stdout.strip()
+    if res.returncode == 0 and re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+        return tag[1:]
+    return "未知版本"
+
 def update_service():
     print("正在获取远程更新并检测版本...", flush=True)
     if os.path.exists(INSTALL_DIR):
@@ -550,9 +626,9 @@ def update_service():
                 time.sleep(3)
                 return
             
-            # Fetch remote origin updates
-            subprocess.run(["git", "fetch", "--all"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+            # 拉取远程分支与版本标签（--force 保证远程重打的标签也能同步）
+            subprocess.run(["git", "fetch", "--all", "--tags", "--force"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             # Detect remote branch (prefer current local branch, fallback to origin/main or origin/master)
             curr = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
             branch = curr.stdout.strip() if curr.returncode == 0 else ""
@@ -563,27 +639,36 @@ def update_service():
                     if chk.returncode == 0:
                         branch = b
                         break
-            
+
+            # 更新目标为最新发行版标签 vX.Y.Z；仓库尚无发行版标签时回退到 origin/<分支>
+            release_tag = latest_release_tag()
+            target = release_tag or f"origin/{branch}"
             local_commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-            remote_commit = subprocess.run(["git", "rev-parse", f"origin/{branch}"], capture_output=True, text=True).stdout.strip()
-            
+            remote_commit = subprocess.run(["git", "rev-parse", f"{target}^{{commit}}"], capture_output=True, text=True).stdout.strip()
+            if not remote_commit:
+                print(f"错误: 无法解析更新目标 {target}，请检查网络后重试。")
+                time.sleep(3)
+                return
+            local_label = f"{installed_app_version()} ({local_commit[:8]})"
+            remote_label = f"{release_tag} ({remote_commit[:8]})" if release_tag else f"{target} ({remote_commit[:8]})"
+
             if local_commit == remote_commit:
-                print("\n【版本状态】当前已是最新版本，无需更新！")
+                print(f"\n【版本状态】当前已是最新发行版 {local_label}，无需更新！")
                 override = input("是否强制重新拉取代码并覆盖安装？(y/N): ").strip().lower()
                 if override != 'y':
                     print("已取消更新。")
                     time.sleep(1.5)
                     return
             else:
-                print(f"\n【检测到更新】本地版本: {local_commit[:8]}，远程最新版本: {remote_commit[:8]}")
+                print(f"\n【检测到更新】本地版本: {local_label}，远程最新发行版: {remote_label}")
                 confirm = input("是否确认开始更新并重启服务？(Y/n): ").strip().lower()
                 if confirm not in ('', 'y', 'yes'):
                     print("已取消更新。")
                     time.sleep(1.5)
                     return
-            
-            print(f"\n正在强制重置本地代码至 origin/{branch} ...", flush=True)
-            subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
+
+            print(f"\n正在强制重置本地代码至 {target} ...", flush=True)
+            subprocess.run(["git", "reset", "--hard", target], check=True)
             mark_login_refresh_required("ml update")
             
             # Clean up python cache files

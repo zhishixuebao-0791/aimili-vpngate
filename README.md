@@ -16,7 +16,18 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本修改版保留源项目的部署脚本、OpenVPN 连接管理、Web 管理界面和本地代理网关能力，并围绕“真实出口延迟排序、低延迟节点保留、收藏/拉黑状态机、固定路由策略”做了定制。
 
+## 版本说明
+
+| 渠道 | 当前版本 | 获取方式 | 说明 |
+| --- | --- | --- | --- |
+| 稳定版 | **v1.26.6** | 一键部署命令 | 经过线上长期运行验证的版本 |
+| 发行版 | **v1.26.10** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
+
+Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版本号。
+
 ## 一键部署
+
+一键部署会安装**稳定版**（当前 `v1.26.6`）。如果服务器上已安装更高的版本（例如通过 `ml update` 升级到了发行版），重新运行一键部署不会降级。
 
 在全新的 Linux VPS 上以 `root` 用户执行:
 
@@ -38,7 +49,7 @@ http://your_vps_ip:8787/随机安全后缀
 ml status    # 查看状态
 ml logs      # 查看实时日志
 ml node-log  # 查看节点切换与异常追踪日志
-ml update    # 从本仓库拉取最新代码并更新服务
+ml update    # 更新到最新发行版（当前 v1.26.10）并重启服务
 ml restart   # 重启服务
 ```
 
@@ -54,14 +65,14 @@ ml restart   # 重启服务
 
 - 真实出口延迟测速: 通过当前 OpenVPN + 本地代理出口检测节点实际延迟，不再只看 VPNGate 原始 ping。
 - 首次自动连接: 首次部署或已有缓存但没有活动连接时，会按当前路由模式测速排序，并自动连接符合规则的最低延迟节点。
-- 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按自动配置连接最低延迟节点。
-- 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序。
-- 终端一键更新: 新增 `ml update` 命令，可在服务器终端从当前 GitHub 仓库拉取最新代码、重跑安装脚本并重启服务。
+- 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按当前路由模式连接符合规则的最低延迟节点（固定 IP 模式不切换）。
+- 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序；当前连接节点若测速达标会保留并参与排序，仅在出现更低延迟节点时切换。
+- 终端一键更新: 新增 `ml update` 命令，可在服务器终端更新到最新发行版、重跑安装脚本并重启服务。
 - 节点活动日志: 新增 `ml node-log` 命令，持续跟踪当前活动节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
   - 文件路径: `/opt/aimilivpn/vpngate_data/node_activity.log`
   - 主服务日志: `/opt/aimilivpn/vpngate_data/vpngate.log`
   - Web 日志面板 JSON: `/opt/aimilivpn/vpngate_data/logs/YYYY-MM-DD.json`
-- 新版本提示: Web UI 登录后会优先检测 GitHub 最新 Release tag，没有 Release 时检测最新 tag；只有仓库发布新 tag 时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
+- 新版本提示: Web UI 登录后会检测 GitHub 仓库中版本号最高的 `vX.Y.Z` 标签（发行版）；只有发布了比当前更新的版本标签时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
 - 高延迟触发刷新: 默认每 30 分钟检测当前已连接节点，只有延迟大于当前阈值才触发新一轮拉取、合并、测速、剔除。
 - 可调巡检策略: 在“代理设置”中可选择 5-60 分钟巡检间隔，以及 200-1000ms 延迟筛选阈值；修改后从保存时间重新计时，下次巡检生效。
 - 延迟过滤: 延迟大于当前阈值的普通节点会被剔除或标记不可用，默认阈值为 `500ms`。
@@ -107,21 +118,28 @@ firewall-cmd --reload
 
 ## 更新服务器上的修改版
 
-如果已经通过本仓库部署到 `/opt/aimilivpn`，可在服务器执行:
+如果已经通过本仓库部署到 `/opt/aimilivpn`（包括旧版本用户），可在服务器执行:
 
 ```bash
 ml update
 ```
 
-也可以手动执行:
+`ml update` 会拉取远程版本标签，对比本地版本与最新发行版，确认后切换到最新发行版并重新运行安装脚本、重启服务。旧版本的 `ml` 也可以直接使用该命令完成升级。
+
+如需切换到指定版本（例如从发行版回退到稳定版），可设置环境变量后运行安装脚本:
 
 ```bash
-cd /opt/aimilivpn
-git pull origin main
-python3 -m py_compile vpn_utils.py vpngate_manager.py proxy_server.py
-systemctl restart aimilivpn.service
-systemctl status aimilivpn.service --no-pager
+AIMILI_DEPLOY_REF=v1.26.6 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
+
+### 发布新版本（维护者）
+
+- **发布新的发行版**:
+  1. 修改 `vpngate_manager.py` 中的 `APP_VERSION`，例如 `1.26.11`。
+  2. 提交到 `main` 后打同名标签，并与 `main` 一起推送: `git tag -a v1.26.11 -m "v1.26.11" && git push origin main v1.26.11`。
+  3. `main` 的最新提交必须始终是最新发行版（旧版 `ml update` 会直接更新到 `main` 的最新提交），未发布的开发改动请放在其他分支。
+- **升级稳定版**: 当某个发行版经过充分验证后，把 `install.sh` 中的 `STABLE_TAG` 改为该版本标签（例如 `v1.26.10`），提交并推送 `main`。
+- 版本标签格式必须是 `vX.Y.Z`，旧的 `V2026.06.16` 这类日期标签不会被识别为版本。
 
 如果系统不是 systemd，请使用安装脚本提供的 `ml` 菜单进行服务管理。
 
@@ -162,6 +180,8 @@ Run as `root` on a fresh Linux VPS:
 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
+Release channels: the one-click installer deploys the **stable** version (currently `v1.26.6`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.10`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
+
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 
 Useful commands:
@@ -178,8 +198,8 @@ ml restart
 
 - Real egress latency testing through the active OpenVPN/local proxy path.
 - First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
-- After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node is connected in automatic mode.
-- Added `ml update` for pulling the latest GitHub code, rerunning the installer, and restarting the service.
+- After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node eligible under the current routing mode is connected (fixed IP mode does not switch).
+- Added `ml update` for upgrading to the latest release tag, rerunning the installer, and restarting the service.
 - Added `ml node-log` for tailing persistent node activity logs, including active node IP, switch time, switch failures, threshold stalls, and background thread crashes.
 - Web UI checks the latest GitHub Release tag, falling back to the latest tag, and shows an update notice only when a new tag is published; ordinary commits do not trigger the notice.
 - Manual refresh merges old and new VPNGate candidates, then benchmarks and sorts them together.
