@@ -19,6 +19,28 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+# 同类失败日志限流：VPN 断开期间每个代理请求都会失败，逐条打印会把日志刷到上百 MB
+LOG_THROTTLE_SECONDS = parse_positive_int(os.environ.get("PROXY_LOG_THROTTLE_SECONDS"), 60)
+_log_throttle_lock = threading.Lock()
+_log_throttle: dict[str, list[float]] = {}
+
+def throttled_print(key: str, message: str) -> None:
+    """同一 key 在 LOG_THROTTLE_SECONDS 内只打印一次，下次打印时附带被省略的条数。"""
+    now = time.time()
+    with _log_throttle_lock:
+        entry = _log_throttle.get(key)
+        if entry and now - entry[0] < LOG_THROTTLE_SECONDS:
+            entry[1] += 1
+            return
+        suppressed = int(entry[1]) if entry else 0
+        _log_throttle[key] = [now, 0]
+        if len(_log_throttle) > 512:
+            for stale_key in [k for k, v in _log_throttle.items() if now - v[0] >= LOG_THROTTLE_SECONDS and not v[1]]:
+                _log_throttle.pop(stale_key, None)
+    if suppressed:
+        message = f"{message} (过去 {LOG_THROTTLE_SECONDS} 秒内同类日志已省略 {suppressed} 条)"
+    print(message, flush=True)
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -112,9 +134,9 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
+                throttled_print("dns-bind-3006", "[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+                throttled_print("dns-bind-3004", "[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！")
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(4096)
@@ -272,7 +294,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         try:
             upstream = create_connection((host, port), timeout=20)
         except Exception as e:
-            print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+            throttled_print(f"socks5|{e}", f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}")
             try:
                 client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             except OSError:
@@ -365,7 +387,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
-        print(f"[HTTP 代理失败] 代理请求目标连接失败: {e}", flush=True)
+        throttled_print(f"http|{e}", f"[HTTP 代理失败] 代理请求目标连接失败: {e}")
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
@@ -386,7 +408,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
-            print(f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}", flush=True)
+            throttled_print(f"client|{err_msg}", f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}")
         try:
             client.close()
         except OSError:
@@ -452,7 +474,7 @@ def start_proxy_server(host: str, port: int) -> None:
         try:
             client, address = server.accept()
             if not proxy_connection_sem.acquire(blocking=False):
-                print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
+                throttled_print("conn-limit", f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}")
                 try:
                     client.close()
                 except OSError:

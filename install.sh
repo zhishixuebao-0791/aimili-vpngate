@@ -519,7 +519,7 @@ def show_logs():
     print("正在查看 AimiliVPN 日志 (按 Ctrl+C 退出)...", flush=True)
     if os.path.exists(LOG_FILE):
         try:
-            subprocess.run(["tail", "-f", "-n", "50", LOG_FILE])
+            subprocess.run(["tail", "-F", "-n", "50", LOG_FILE])
         except KeyboardInterrupt:
             pass
     else:
