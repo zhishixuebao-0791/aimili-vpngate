@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.12"
+APP_VERSION = "1.26.13"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示以最高的 vX.Y.Z 标签（即发行版）为准
 STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
@@ -2281,16 +2281,28 @@ def build_interface_probe_request(url: str) -> tuple[str, str, str]:
     probe_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
     return probe_url, route_ip, host
 
+# 出口延迟测速目标：(URL, 响应体是否直接为 IP)。节点测速与连接后代理测速共用，各请求一次取最快，保证口径一致
+EGRESS_LATENCY_TARGETS = [
+    ("http://cp.cloudflare.com/generate_204", False),
+    ("http://api.ipify.org", True),
+    ("http://ip.sb", True),
+    ("http://1.1.1.1/cdn-cgi/trace", False),
+]
+
+def parse_egress_ip_from_body(body: str, body_is_ip: bool) -> str:
+    body = body.strip()
+    if body_is_ip and re.match(r"^[0-9a-fA-F:.]+$", body):
+        return body
+    if "ip=" in body:
+        for part in body.splitlines():
+            if part.startswith("ip="):
+                return part.removeprefix("ip=").strip()
+    return ""
+
 def measure_interface_egress_latency(dev: str, timeout: int = 8, deadline: float | None = None) -> dict[str, Any]:
-    targets = [
-        ("http://cp.cloudflare.com/generate_204", False),
-        ("http://api.ipify.org", True),
-        ("http://ip.sb", True),
-        ("http://1.1.1.1/cdn-cgi/trace", False),
-    ]
     best: dict[str, Any] | None = None
     last_error = ""
-    for url, body_is_ip in targets:
+    for url, body_is_ip in EGRESS_LATENCY_TARGETS:
         effective_timeout = timeout
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -2333,15 +2345,7 @@ def measure_interface_egress_latency(dev: str, timeout: int = 8, deadline: float
                 last_error = f"http {http_code}"
                 continue
             latency_ms = int(float(total_time_str) * 1000)
-            ip = ""
-            body = "\n".join(lines[:-1]).strip()
-            if body_is_ip and re.match(r"^[0-9a-fA-F:.]+$", body):
-                ip = body
-            elif "ip=" in body:
-                for part in body.splitlines():
-                    if part.startswith("ip="):
-                        ip = part.removeprefix("ip=").strip()
-                        break
+            ip = parse_egress_ip_from_body("\n".join(lines[:-1]), body_is_ip)
             result = {"ok": True, "latency_ms": latency_ms, "ip": ip, "via": dev, "url": url}
             if best is None or latency_ms < parse_int(best.get("latency_ms")):
                 best = result
@@ -3156,15 +3160,6 @@ def connect_node(node_id: str) -> str:
         last_active_latency = 0
         
         set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
-        try:
-            ip = node.get("ip") or node.get("remote_host")
-            port = parse_int(node.get("remote_port"))
-            fallback = parse_int(node.get("ping"))
-            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-            if latency > 0:
-                last_active_latency = latency
-        except Exception:
-            pass
             
         _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
         update_node_flags_locked(node_id, active=True, probe_message=f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}")
@@ -6557,8 +6552,9 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
-    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
-    def _curl_check_ip(url: str) -> dict[str, Any] | None:
+    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试出口 IP 与实际延迟
+    def _curl_via_proxy(url: str, max_time: int) -> tuple[int, str, str] | None:
+        """经本地代理请求 url，成功返回 (延迟毫秒, HTTP 状态码, 响应体)。"""
         proxy_hosts = []
         if LOCAL_PROXY_HOST == "::":
             proxy_hosts = ["[::1]", "127.0.0.1"]
@@ -6577,33 +6573,44 @@ def check_proxy_health() -> dict[str, Any]:
                 "-w", "\n%{time_total} %{http_code}",
                 "-x", proxy_url,
                 url,
-                "--max-time", "5"
+                "--max-time", str(max_time)
             ]
             if proxy_user is not None and proxy_pass is not None:
                 cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 1)
                 if res.returncode == 0:
                     lines = res.stdout.strip().splitlines()
-                    if len(lines) >= 2:
-                        ip = lines[0].strip()
-                        time_info = lines[1].strip().split()
+                    # 计时固定在最后一行；ip.sb 等响应体自带换行，不能按固定行号取
+                    if lines:
+                        time_info = lines[-1].strip().split()
                         if len(time_info) == 2:
                             total_time_str, http_code = time_info
-                            if http_code == "200" and ip:
-                                latency_ms = int(float(total_time_str) * 1000)
-                                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+                            return int(float(total_time_str) * 1000), http_code, "\n".join(lines[:-1])
             except Exception:
                 pass
         return None
 
     try:
-        result = _curl_check_ip("http://ip.sb")
-        if result:
-            return result
-        result = _curl_check_ip("http://api.ipify.org")
-        if result:
-            return result
+        best_latency: int | None = None
+        egress_ip = ""
+        budget_deadline = time.monotonic() + 12
+        for url, body_is_ip in EGRESS_LATENCY_TARGETS:
+            remaining = budget_deadline - time.monotonic()
+            if remaining < 1:
+                break
+            fetched = _curl_via_proxy(url, max(1, min(5, int(remaining))))
+            if not fetched:
+                continue
+            latency_ms, http_code, body = fetched
+            if http_code not in ("200", "204"):
+                continue
+            if best_latency is None or latency_ms < best_latency:
+                best_latency = latency_ms
+            if not egress_ip:
+                egress_ip = parse_egress_ip_from_body(body, body_is_ip)
+        if best_latency is not None and egress_ip:
+            return {"ok": True, "ip": egress_ip, "latency_ms": max(1, best_latency)}
             
         # 此时外网测试失败，检测本地代理端口是否依然能连通。若仍能连通，直接抛出出口测试失败，不调用占用诊断
         port_still_listening = False
@@ -6908,7 +6915,7 @@ class Handler(BaseHTTPRequestHandler):
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION).encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
-            global last_active_ping_time, last_active_latency, active_openvpn_node_id
+            global last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
             enforce_active_not_manual_blacklisted()
             nodes = read_nodes()
@@ -6916,26 +6923,12 @@ class Handler(BaseHTTPRequestHandler):
             for n in nodes:
                 n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
             if active_node:
-                ip = active_node.get("ip") or active_node.get("remote_host")
-                if ip:
-                    now = time.time()
-                    if now - last_active_ping_time > 15.0:
-                        last_active_ping_time = now
-                        def bg_ping(ip_addr: str, port: int, fallback: int) -> None:
-                            global last_active_latency
-                            try:
-                                latency = vpn_utils.ping_latency_ms(ip_addr, port, fallback)
-                                if latency > 0:
-                                    last_active_latency = latency
-                            except Exception:
-                                pass
-                        threading.Thread(
-                            target=bg_ping, 
-                            args=(ip, parse_int(active_node.get("remote_port")), parse_int(active_node.get("ping"))),
-                            daemon=True
-                        ).start()
-                    if last_active_latency > 0:
-                        active_node["latency_ms"] = last_active_latency
+                # 与其他节点的测速口径一致：显示经隧道的真实出口延迟（后台代理检测每 30 秒更新）
+                state_now = read_json(STATE_FILE, {})
+                live_latency = parse_int(state_now.get("proxy_latency_ms")) if state_now.get("proxy_ok") else 0
+                shown_latency = live_latency or last_active_latency
+                if shown_latency > 0:
+                    active_node["latency_ms"] = shown_latency
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()

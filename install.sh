@@ -65,7 +65,7 @@ DEFAULT_DEPLOY_BRANCH="main"
 # 版本渠道说明：
 #   稳定版 (STABLE_TAG)：一键部署命令安装的版本。稳定版升级时只需修改此处并推送 main。
 #   发行版 (最高的 vX.Y.Z 标签)：ml update 更新到的版本。
-STABLE_TAG="v1.26.7"
+STABLE_TAG="v1.26.8"
 
 # 自动检测本地已安装版本当前所在的分支
 CURRENT_BRANCH=""
