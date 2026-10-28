@@ -107,13 +107,17 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.11"
+APP_VERSION = "1.26.12"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示以最高的 vX.Y.Z 标签（即发行版）为准
 STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
+# 没有活动连接且当前路由范围内找不到可用节点时，重新拉取 VPNGate 节点的最短间隔
+NO_NODE_REFETCH_SECONDS = env_int("NO_NODE_REFETCH_SECONDS", 300, 30)
+# vpngate.log 超过该大小后轮转为 vpngate.log.1（0 表示不轮转）
+LOG_FILE_MAX_BYTES = env_int("LOG_FILE_MAX_BYTES", 20 * 1024 * 1024, 0)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
@@ -171,6 +175,8 @@ last_active_ping_time = 0.0
 last_active_latency = 0
 
 last_collector_heartbeat = 0.0
+last_no_node_refetch_at = 0.0
+no_node_refetch_failures = 0
 last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
 server_start_time = time.time()
@@ -3288,11 +3294,43 @@ def reconnect_fixed_ip_node(reason: str) -> bool:
         log_to_json("WARNING", "VPN", msg)
         return False
 
+def no_node_refetch_interval() -> int:
+    """无可用节点时的重新拉取间隔：连续失败按 2 倍退避，封顶为常规拉取间隔，避免频繁请求 VPNGate。"""
+    cap = max(NO_NODE_REFETCH_SECONDS, FETCH_INTERVAL_SECONDS)
+    return min(NO_NODE_REFETCH_SECONDS * (2 ** min(no_node_refetch_failures, 8)), cap)
+
+def refetch_when_no_usable_node() -> str | None:
+    """没有活动连接时按间隔重新拉取节点；否则缓存中没有当前地区可用节点会永远卡在无连接状态。"""
+    global last_no_node_refetch_at, no_node_refetch_failures
+    if active_openvpn_node_id or active_openvpn_running():
+        no_node_refetch_failures = 0
+        return None
+    now = time.time()
+    try:
+        last_fetch_at = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
+    except (TypeError, ValueError):
+        last_fetch_at = 0.0
+    interval = no_node_refetch_interval()
+    if now - max(last_fetch_at, last_no_node_refetch_at) < interval:
+        return None
+    last_no_node_refetch_at = now
+    msg = f"当前路由范围内没有可用节点且无活动连接，重新从 VPNGate 拉取节点（间隔 {interval} 秒）..."
+    print(f"[守护线程] {msg}", flush=True)
+    log_to_json("INFO", "Main", msg)
+    res = refresh_test_prune_and_maybe_switch("no usable node in routing scope")
+    if active_openvpn_node_id or active_openvpn_running():
+        no_node_refetch_failures = 0
+    else:
+        no_node_refetch_failures += 1
+    log_to_json("INFO", "Main", f"无可用节点重新拉取完成，结果: {res}")
+    return res
+
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
         last_collector_heartbeat = time.time()
         success = False
+        no_node_wait = False
         try:
             if not cached_nodes():
                 print("[守护线程] 当前没有节点缓存，执行首次节点拉取与可用性检测...", flush=True)
@@ -3320,9 +3358,10 @@ def collector_loop() -> None:
                     print("[守护线程] 节点缓存已存在但没有活动连接，按当前路由模式执行一次测速排序与切换。", flush=True)
                     log_to_json("INFO", "Main", "节点缓存已存在但没有活动连接，按当前路由模式执行一次测速排序与切换。")
                     res = test_current_routing_scope_and_maybe_switch("startup cached nodes")
-                    if "没有可测速节点" not in res:
-                        success = True
                     log_to_json("INFO", "Main", f"缓存节点启动测速切换完成，结果: {res}")
+                    refetch_when_no_usable_node()
+                    success = bool(active_openvpn_node_id or active_openvpn_running())
+                    no_node_wait = not success
                 else:
                     success = True
                     set_state(is_connecting=is_connecting, last_check_message="节点缓存已存在，后台不再无条件刷新；仅在活动节点延迟超过阈值时刷新")
@@ -3332,12 +3371,30 @@ def collector_loop() -> None:
             log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
-        if not active_openvpn_running() and not success:
+        if no_node_wait:
+            # 缓存节点都不可用：按重新拉取间隔等待，避免每 30 秒空转一次刷屏
+            sleep_time = min(no_node_refetch_interval(), CHECK_INTERVAL_SECONDS)
+        elif not active_openvpn_running() and not success:
             sleep_time = 30
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
-            
-        time.sleep(sleep_time)
+
+        was_connected = bool(active_openvpn_node_id or active_openvpn_running())
+        disconnected_checks = 0
+        deadline = time.time() + sleep_time
+        while time.time() < deadline:
+            time.sleep(min(30, max(0.0, deadline - time.time())))
+            idle_disconnected = (
+                not is_connecting
+                and not maintenance_lock.locked()
+                and not active_openvpn_node_id
+                and not active_openvpn_running()
+            )
+            disconnected_checks = disconnected_checks + 1 if idle_disconnected else 0
+            if was_connected and disconnected_checks >= 2:
+                # 连接中途断开且持续空闲（如自动切换候选全部失败）：提前进入下一轮，由无可用节点重新拉取逻辑兜底。
+                # 要求连续两次观察到，避免在自动切换两个候选之间的瞬时空档抢占
+                break
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -6442,14 +6499,14 @@ function exportLogContent() {
 </script>
 </body></html>"""
 
-def check_proxy_health() -> dict[str, Any]:
-    # 1. 检测代理服务端口是否在监听
+def local_proxy_port_connect_error(timeout: float) -> Exception | None:
+    """尝试连接本地代理端口，成功返回 None，失败返回异常。"""
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     s = None
     try:
         s = socket.socket(af, socket.SOCK_STREAM)
-        s.settimeout(1.5)
+        s.settimeout(timeout)
         connect_host = LOCAL_PROXY_HOST
         if connect_host in ("::", "0.0.0.0", ""):
             connect_host = "::1" if is_ipv6 else "127.0.0.1"
@@ -6459,23 +6516,38 @@ def check_proxy_health() -> dict[str, Any]:
             if connect_host == "::1":
                 s.close()
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1.5)
+                s.settimeout(timeout)
                 s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
             else:
                 raise e
+        return None
     except Exception as e:
-        diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
-        diag_msg = diag[1] if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e}"
-        return {
-            "ok": False,
-            "error": f"代理服务未运行 ({diag_msg})"
-        }
+        return e
     finally:
         if s is not None:
             try:
                 s.close()
             except Exception:
                 pass
+
+def check_proxy_health() -> dict[str, Any]:
+    # 1. 检测代理服务端口是否在监听（偶发超时先重试一次，避免误判）
+    is_ipv6 = ":" in LOCAL_PROXY_HOST
+    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+    connect_error = local_proxy_port_connect_error(1.5)
+    if connect_error is not None:
+        time.sleep(1)
+        connect_error = local_proxy_port_connect_error(3.0)
+    if connect_error is not None:
+        diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
+        diag_msg = f"{diag[1]} 原始错误: {connect_error}" if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {connect_error}"
+        prefix = "本地代理网关连接超时" if diag and diag[0] == 3011 else "代理服务未运行"
+        # local_failure: 故障在本机代理网关而非 VPN 节点，调用方不能据此拉黑节点
+        return {
+            "ok": False,
+            "local_failure": True,
+            "error": f"{prefix} ({diag_msg})"
+        }
 
     # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
     tun_path = Path("/sys/class/net/tun0")
@@ -6564,7 +6636,7 @@ def check_proxy_health() -> dict[str, Any]:
         if not port_still_listening:
             diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
             if diag:
-                return {"ok": False, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
+                return {"ok": False, "local_failure": True, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
             
         return {"ok": False, "error": "出口连接测试失败 (ip.sb 和 api.ipify.org 均无法连通，可能是节点已失效或 VPS 防火墙限制了 UDP/TCP 出站端口)"}
     except Exception as e:
@@ -6607,8 +6679,11 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
+                if res.get("local_failure") and active_openvpn_running():
+                    # 本机代理网关的问题（如瞬时繁忙）与节点无关：不拉黑、不切换，下个周期重新检测
+                    log_to_json("WARNING", "Proxy", f"本机代理网关异常，跳过节点拉黑与切换: {error_msg}")
                 # If we intended to have an active VPN node but proxy failed, trigger auto-switch
-                if active_openvpn_node_id:
+                elif active_openvpn_node_id:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
@@ -7432,19 +7507,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
 class Tee:
-    def __init__(self, file_path: str):
-        Path(file_path).parent.mkdir(exist_ok=True, parents=True)
-        self.file = open(file_path, "a", encoding="utf-8")
+    def __init__(self, file_path: str, max_bytes: int = 0):
+        self.path = Path(file_path)
+        self.path.parent.mkdir(exist_ok=True, parents=True)
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.file = open(self.path, "a", encoding="utf-8")
         self.stdout = sys.stdout
+        with self.lock:
+            self._rotate_if_needed()
+
+    def _rotate_if_needed(self) -> None:
+        # 超过上限时把当前文件改名为 .1（覆盖旧备份），只保留一份历史，防止日志无限增长
+        if self.max_bytes <= 0 or self.file.tell() < self.max_bytes:
+            return
+        self.file.close()
+        try:
+            os.replace(self.path, self.path.with_name(self.path.name + ".1"))
+        except OSError:
+            pass
+        self.file = open(self.path, "a", encoding="utf-8")
 
     def write(self, data: str) -> None:
         self.stdout.write(data)
-        self.file.write(data)
-        self.file.flush()
+        with self.lock:
+            self.file.write(data)
+            self.file.flush()
+            self._rotate_if_needed()
 
     def flush(self) -> None:
         self.stdout.flush()
-        self.file.flush()
+        with self.lock:
+            self.file.flush()
 
     def isatty(self) -> bool:
         return self.stdout.isatty()
@@ -7459,7 +7553,7 @@ def main() -> None:
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
-    tee = Tee(str(log_file))
+    tee = Tee(str(log_file), LOG_FILE_MAX_BYTES)
     sys.stdout = tee
     sys.stderr = tee
 

@@ -20,13 +20,17 @@ Bilingual: [中文](#中文) | [English](#english)
 
 | 渠道 | 当前版本 | 获取方式 | 说明 |
 | --- | --- | --- | --- |
-| 稳定版 | **v1.26.6** | 一键部署命令 | 经过线上长期运行验证的版本 |
-| 发行版 | **v1.26.11** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
+| 稳定版 | **v1.26.7** | 一键部署命令 | 经过线上长期运行验证的版本 |
+| 发行版 | **v1.26.12** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
 
 Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版本号。
 
 ### 更新日志
 
+- **v1.26.12** / **v1.26.7**（稳定版）：线上日志排查修复
+  - 修复固定地区等模式下当前范围没有可用节点时卡死在无连接状态：没有活动连接时从 5 分钟（`NO_NODE_REFETCH_SECONDS`）起按 2 倍退避（封顶 21 分钟）重新从 VPNGate 拉取节点；连接中途断开并持续空闲约 1 分钟后进入兜底流程。
+  - 修复本机代理端口被本服务自己监听时误报"端口被其他进程占用"（ERR_PORT_IN_USE），本机代理网关故障不再拉黑正常节点、不再触发切换；本地端口偶发超时先重试一次，并在提示中保留原始错误。
+  - 代理失败日志按同类错误限流（每类 60 秒打印 1 条，附省略条数）；`vpngate.log` 超过 20MB（`LOG_FILE_MAX_BYTES`）自动轮转为 `vpngate.log.1`，`ml` 查看日志改为 `tail -F` 以跟随轮转。
 - **v1.26.11**
   - 不可用节点统一清理：除超时（-1）外，其他失败（显示 `-`）也计入连续失败并进入阶梯冷却（30 分钟 / 2 小时 / 6 小时 / 24 小时）；连续失败 4 次或已从 VPNGate 下线的节点自动移出列表，避免死节点无限堆积、拖慢测速。
   - 节点数超过上限时优先丢弃不可用节点，保证新节点能进入列表。
@@ -39,7 +43,7 @@ Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版�
 
 ## 一键部署
 
-一键部署会安装**稳定版**（当前 `v1.26.6`）。如果服务器上已安装更高的版本（例如通过 `ml update` 升级到了发行版），重新运行一键部署不会降级。
+一键部署会安装**稳定版**（当前 `v1.26.7`）。如果服务器上已安装更高的版本（例如通过 `ml update` 升级到了发行版），重新运行一键部署不会降级。
 
 在全新的 Linux VPS 上以 `root` 用户执行:
 
@@ -61,7 +65,7 @@ http://your_vps_ip:8787/随机安全后缀
 ml status    # 查看状态
 ml logs      # 查看实时日志
 ml node-log  # 查看节点切换与异常追踪日志
-ml update    # 更新到最新发行版（当前 v1.26.11）并重启服务
+ml update    # 更新到最新发行版（当前 v1.26.12）并重启服务
 ml restart   # 重启服务
 ```
 
@@ -141,7 +145,7 @@ ml update
 如需切换到指定版本（例如从发行版回退到稳定版），可设置环境变量后运行安装脚本:
 
 ```bash
-AIMILI_DEPLOY_REF=v1.26.6 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+AIMILI_DEPLOY_REF=v1.26.7 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
 ### 发布新版本（维护者）
@@ -192,7 +196,7 @@ Run as `root` on a fresh Linux VPS:
 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-Release channels: the one-click installer deploys the **stable** version (currently `v1.26.6`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.11`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
+Release channels: the one-click installer deploys the **stable** version (currently `v1.26.7`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.12`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
 
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 

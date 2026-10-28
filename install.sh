@@ -65,7 +65,7 @@ DEFAULT_DEPLOY_BRANCH="main"
 # 版本渠道说明：
 #   稳定版 (STABLE_TAG)：一键部署命令安装的版本。稳定版升级时只需修改此处并推送 main。
 #   发行版 (最高的 vX.Y.Z 标签)：ml update 更新到的版本。
-STABLE_TAG="v1.26.6"
+STABLE_TAG="v1.26.7"
 
 # 自动检测本地已安装版本当前所在的分支
 CURRENT_BRANCH=""
@@ -578,7 +578,7 @@ def show_logs():
     print("正在查看 AimiliVPN 日志 (按 Ctrl+C 退出)...", flush=True)
     if os.path.exists(LOG_FILE):
         try:
-            subprocess.run(["tail", "-f", "-n", "50", LOG_FILE])
+            subprocess.run(["tail", "-F", "-n", "50", LOG_FILE])
         except KeyboardInterrupt:
             pass
     else:

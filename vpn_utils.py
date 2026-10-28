@@ -978,6 +978,36 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
     return 2010, "[ERR_OVPN_UNKNOWN] OpenVPN 其他运行时异常。原因: 连接握手期间发生其他协议错误，详细信息请查看日志尾部。"
 
 
+def port_listened_by_current_process(port: int) -> bool:
+    """Linux 下判断监听该 TCP 端口的套接字是否属于当前进程（比对 /proc/net/tcp* 与 /proc/self/fd 的 inode）。"""
+    try:
+        inodes = set()
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith("socket:["):
+                inodes.add(target[8:-1])
+    except OSError:
+        return False
+    if not inodes:
+        return False
+    port_hex = f"{port:04X}"
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    # 字段: sl local_address rem_address st ... inode(第 10 列)；st=0A 表示 LISTEN
+                    if len(parts) > 9 and parts[3] == "0A" and parts[1].rsplit(":", 1)[-1] == port_hex and parts[9] in inodes:
+                        return True
+        except OSError:
+            continue
+    return False
+
+
 def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1") -> tuple[int, str] | None:
     import sys
     # 1. 检查端口是否被占用
@@ -991,6 +1021,9 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
     except OSError as e:
         if e.errno == 98 or e.errno == 10048 or "already in use" in str(e).lower() or "not supported" in str(e).lower():
             if e.errno in (98, 10048) or "already in use" in str(e).lower():
+                if port_listened_by_current_process(proxy_port):
+                    # 端口由本服务自己的代理网关监听，不是被其他进程抢占
+                    return 3011, f"[ERR_PROXY_BUSY] 本地代理端口 {proxy_port} 正由本服务监听，但本机连接测试超时。原因: 可能是代理网关瞬时繁忙（客户端并发连接过多），属于本机问题而非节点故障。"
                 return 3005, f"[ERR_PORT_IN_USE] 本地代理端口 {proxy_port} 被占用。原因: 其他进程已抢占该端口，导致本系统代理网关启动失败。请运行 'lsof -i :{proxy_port}' 检查占用进程。"
     finally:
         if s is not None:
