@@ -65,7 +65,7 @@ DEFAULT_DEPLOY_BRANCH="main"
 # 版本渠道说明：
 #   稳定版 (STABLE_TAG)：一键部署命令安装的版本。稳定版升级时只需修改此处并推送 main。
 #   发行版 (最高的 vX.Y.Z 标签)：ml update 更新到的版本。
-STABLE_TAG="v1.26.8"
+STABLE_TAG="v1.26.9"
 
 # 自动检测本地已安装版本当前所在的分支
 CURRENT_BRANCH=""
@@ -175,6 +175,14 @@ else
     checkout_deploy_target
 fi
 echo -e "${GREEN}  -> 当前部署版本: $(installed_version)${PLAIN}"
+
+# Persist conntrack tuning after checking out the selected source version.
+if [ "${AIMILI_CONNTRACK_TUNING:-1}" != "0" ] && [ -f "${INSTALL_DIR}/conntrack_tuning.py" ]; then
+    echo -e "${YELLOW}正在配置连接跟踪表与本机回环规则...${PLAIN}"
+    if ! python3 "${INSTALL_DIR}/conntrack_tuning.py" install; then
+        echo -e "${YELLOW}警告: 网络调优未完成，已尝试恢复原配置；请检查上方提示。AimiliVPN安装继续。${PLAIN}"
+    fi
+fi
 
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
@@ -702,6 +710,12 @@ def uninstall_service():
     confirm = input("确定要完全卸载 AimiliVPN 吗？(y/N): ")
     if confirm.lower() == 'y':
         print("正在完全卸载 AimiliVPN...", flush=True)
+        network_tool = os.path.join(INSTALL_DIR, "conntrack_tuning.py")
+        if os.path.isfile(network_tool):
+            result = subprocess.run([sys.executable, network_tool, "rollback"])
+            if result.returncode:
+                print("网络调优回退未完成，为保留回退工具，本次停止卸载。请核对提示后重试。")
+                return
         stop_service()
         if shutil.which("systemctl"):
             subprocess.run(["systemctl", "disable", "aimilivpn.service"])

@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.13"
+APP_VERSION = "1.26.14"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示以最高的 vX.Y.Z 标签（即发行版）为准
 STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
@@ -1510,6 +1510,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "--auth-user-pass",
             str(AUTH_FILE),
             "--auth-nocache",
+            "--remote-cert-tls",
+            "server",
         ]
     )
     

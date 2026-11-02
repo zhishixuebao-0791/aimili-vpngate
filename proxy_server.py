@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+import errno
+import ipaddress
 import os
 import secrets
 import select
@@ -200,6 +202,31 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         return None
     return None
 
+def tun0_supports_ipv6() -> bool:
+    """Require a usable IPv6 address and a public-unicast route on tun0."""
+    try:
+        with open("/proc/net/if_inet6", encoding="ascii") as source:
+            addresses = [line.split() for line in source]
+        if not any(len(row) == 6 and row[5] == "tun0" and int(row[3], 16) == 0
+                   and not ipaddress.IPv6Address(int(row[0], 16)).is_unspecified
+                   for row in addresses):
+            return False
+        with open("/proc/net/ipv6_route", encoding="ascii") as source:
+            for line in source:
+                row = line.split()
+                if len(row) != 10 or row[-1] != "tun0":
+                    continue
+                prefix, flags = int(row[1], 16), int(row[8], 16)
+                if prefix > 3 or not flags & 1 or flags & 0x200:
+                    continue
+                network = ipaddress.IPv6Network((int(row[0], 16), prefix))
+                if ipaddress.IPv6Address("2000::") in network:
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     try:
         socket.inet_aton(host)
@@ -208,10 +235,19 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         pass
     try:
         socket.inet_pton(socket.AF_INET6, host)
-        return host
     except OSError:
         pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    else:
+        if not tun0_supports_ipv6():
+            raise OSError(errno.EAFNOSUPPORT,
+                          "[ERR_PROXY_IPV6_UNAVAILABLE] 当前 VPNGate 出口没有 IPv6 外网路由，请使用 IPv4 或双栈域名")
+        return host
+    ipv4 = dns_query_over_tun0(host, 1, dns_server, timeout)
+    if ipv4:
+        return ipv4
+    if tun0_supports_ipv6():
+        return dns_query_over_tun0(host, 28, dns_server, timeout)
+    return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
@@ -220,7 +256,13 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         host = resolved_ip
 
     err = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+    if resolved_ip:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    else:
+        family = socket.AF_UNSPEC if tun0_supports_ipv6() else socket.AF_INET
+    addresses = sorted(socket.getaddrinfo(host, port, family, socket.SOCK_STREAM),
+                       key=lambda row: row[0] != socket.AF_INET)
+    for res in addresses:
         af, socktype, proto, canonname, sa = res
         sock = None
         try:
@@ -296,7 +338,8 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         except Exception as e:
             throttled_print(f"socks5|{e}", f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}")
             try:
-                client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                reply = 8 if isinstance(e, OSError) and e.errno == errno.EAFNOSUPPORT else 4
+                client.sendall(bytes((5, reply, 0, 1, 0, 0, 0, 0, 0, 0)))
             except OSError:
                 pass
             raise
