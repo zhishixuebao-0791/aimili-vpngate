@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.8"
+APP_VERSION = "1.26.9"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
@@ -1465,6 +1465,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "--auth-user-pass",
             str(AUTH_FILE),
             "--auth-nocache",
+            "--remote-cert-tls",
+            "server",
         ]
     )
     

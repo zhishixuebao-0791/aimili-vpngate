@@ -16,6 +16,8 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本修改版保留源项目的部署脚本、OpenVPN 连接管理、Web 管理界面和本地代理网关能力，并围绕“真实出口延迟排序、低延迟节点保留、收藏/拉黑状态机、固定路由策略”做了定制。
 
+当前稳定版为 **v1.26.9**：包含IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优与回退。详见[更新记录](CHANGELOG.md)。
+
 ## 一键部署
 
 在全新的 Linux VPS 上以 `root` 用户执行:
@@ -85,6 +87,22 @@ ml restart   # 重启服务
 - 固定 IP: 锁定当前手动选择的节点，不会因为当前节点不可用而自动切换，但仍会定期测速并刷新候选节点列表。
 - 固定地区: 只在指定国家/地区和 IP 类型范围内测速排序，并选择最低延迟节点。
 - 固定收藏菜单: 只在收藏节点中测速排序并选择最低延迟节点；如果收藏节点全部不可用，是否回退到非收藏节点由收藏管理面板选项决定。
+
+## 网络调优与回退
+
+安装脚本会自动配置 conntrack：连接表上限至少 `65536`，哈希桶至少 `16384`，已建立 TCP 条目超时最多 `7200` 秒。已有更大容量或更短超时会保留。仅对回环网卡 `lo` 添加双向 NOTRACK；已有规则不会重复添加，支持 systemd 和 OpenRC 开机应用。模块无法加载、参数只读或 raw 表不可用时会明确提示，不会清空防火墙或连接表。
+
+安装前的配置和运行时值保存在 `/var/lib/aimilivpn-network/`。需要回退时执行：
+
+```bash
+python3 /opt/aimilivpn/conntrack_tuning.py rollback
+```
+
+回退只移除本程序标记的规则，恢复安装前文件及仍保持本程序设置值的运行时参数；遇到安装后被另行修改的配置会停止并提示核对。`ml uninstall` 会先执行该回退。首次安装若要跳过调优，在运行安装脚本前设置 `AIMILI_CONNTRACK_TUNING=0`；该开关不会撤销已经生效的设置。
+
+代理会按 VPNGate 隧道实际能力选择 IPv4/IPv6；没有 IPv6 出口时拒绝 IPv6-only 目标，不会绕到 VPS 直连。OpenVPN 主连接和探测均要求服务端证书用途（`remote-cert-tls server`），保留 CA 验证；不支持该用途校验的节点不能通过探测。
+
+参数参考：[Linux conntrack 文档](https://docs.kernel.org/networking/nf_conntrack-sysctl.html)、[OpenRC 服务指南](https://github.com/OpenRC/openrc/blob/master/service-script-guide.md)、[OpenVPN 手册](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual/)。
 
 ## 端口与安全
 
