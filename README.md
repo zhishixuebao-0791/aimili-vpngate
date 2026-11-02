@@ -16,7 +16,7 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本修改版保留源项目的部署脚本、OpenVPN 连接管理、Web 管理界面和本地代理网关能力，并围绕“真实出口延迟排序、低延迟节点保留、收藏/拉黑状态机、固定路由策略”做了定制。
 
-当前稳定版为 **v1.26.15**：包含IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优与回退。详见[更新记录](CHANGELOG.md)。
+当前提供**稳定版 v1.26.15** 和**发行版 v1.26.16**，首次安装由用户自行选择，后续更新保持所选渠道。两者均包含IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优与回退。详见[更新记录](CHANGELOG.md)。
 
 ## 一键部署
 
@@ -71,7 +71,7 @@ ml restart   # 重启服务
   - 文件路径: `/opt/aimilivpn/vpngate_data/node_activity.log`
   - 主服务日志: `/opt/aimilivpn/vpngate_data/vpngate.log`
   - Web 日志面板 JSON: `/opt/aimilivpn/vpngate_data/logs/YYYY-MM-DD.json`
-- 新版本提示: Web UI 登录后会优先检测 GitHub 最新 Release tag，没有 Release 时检测最新 tag；只有仓库发布新 tag 时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
+- 新版本提示: Web UI 只提示已安装渠道的新版本，不会因为另一渠道版本更高而提示升级。
 - 高延迟触发刷新: 默认每 30 分钟检测当前已连接节点，只有延迟大于当前阈值才触发新一轮拉取、合并、测速、剔除。
 - 可调巡检策略: 在“代理设置”中可选择 5-60 分钟巡检间隔，以及 200-1000ms 延迟筛选阈值；修改后从保存时间重新计时，下次巡检生效。
 - 延迟过滤: 延迟大于当前阈值的普通节点会被剔除或标记不可用，默认阈值为 `500ms`。
@@ -98,7 +98,7 @@ ml restart   # 重启服务
 
 ### 渠道隔离
 
-- 稳定版只能自动更新到新的稳定版；发行版只能自动更新到新的发行版。首次安装默认稳定版；首次选择发行版可设置 `AIMILI_CHANNEL=release`。已有安装拒绝利用该变量或另一渠道标签串渠道重装。
+- 首次安装由用户在上方两条一键部署命令中选择渠道。稳定版只更新到新的稳定版，发行版只更新到新的发行版；重装也保持原渠道。
 - 本机渠道记录位于 `vpngate_data/update_channel.json`，代码同时带有 `APP_CHANNEL`。远端 `release_channels.json` 为两渠道分别指定版本，不以全局最大版本号判断渠道。
 - 旧ml可能先把源码重置到main；新安装脚本通过ORIG_HEAD/reflog识别更新前的渠道，在生成服务/启动程序前恢复到本渠道目标。若记录不明、清单缺失或目标渠道不符，会停止，能确认旧提交时会恢复旧源码，不静默转到main。
 - 本次稳定版使用v1.26.15、发行版使用v1.26.16，因为v1.26.10等旧标签已发布，不可覆盖。渠道由元数据确定，与版本号数字大小无关。
@@ -222,7 +222,7 @@ ml restart
 - Real egress latency testing through the active OpenVPN/local proxy path.
 - First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
 - After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node is connected in automatic mode.
-- Added `ml update` for pulling the latest GitHub code, rerunning the installer, and restarting the service.
+- `ml update` upgrades within the installed channel, reruns that channel's installer, and restarts the service.
 - Added `ml node-log` for tailing persistent node activity logs, including active node IP, switch time, switch failures, threshold stalls, and background thread crashes.
 - The Web UI reads the channel manifest and advertises updates only within its own channel.
 - Manual refresh merges old and new VPNGate candidates, then benchmarks and sorts them together.
