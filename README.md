@@ -20,13 +20,14 @@ Bilingual: [中文](#中文) | [English](#english)
 
 | 渠道 | 当前版本 | 获取方式 | 说明 |
 | --- | --- | --- | --- |
-| 稳定版 | **v1.26.9** | 一键部署命令 | 经过线上长期运行验证的版本 |
-| 发行版 | **v1.26.14** | `ml update` | 最新功能与修复，已安装用户可主动升级 |
+| 稳定版 | **v1.26.15** | 一键部署、同渠道ml update | 稳定分支维护，默认安装 |
+| 发行版 | **v1.26.16** | 首次指定release、同渠道ml update | 发行分支维护 |
 
 Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版本号。
 
 ### 更新日志
 
+- **v1.26.16** / **v1.26.15**（稳定版）：锁定原安装渠道；兼容旧ml升级、detached HEAD、安装重跑与Web提示。
 - **v1.26.14** / **v1.26.9**（稳定版）：IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优、持久化和回退。详见 [更新记录](CHANGELOG.md)。
 - **v1.26.13** / **v1.26.8**（稳定版）：连接前后延迟口径统一
   - 修复连接后延迟检测解析错误：ip.sb 响应体自带换行导致计时解析失败、每次都退回到响应很慢的 api.ipify.org，延迟被虚高约 200ms，并可能误触发延迟巡检切换节点。
@@ -48,12 +49,18 @@ Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版�
 
 ## 一键部署
 
-一键部署会安装**稳定版**（当前 `v1.26.9`）。如果服务器上已安装更高的版本（例如通过 `ml update` 升级到了发行版），重新运行一键部署不会降级。
+在全新的 Linux VPS 上以 `root` 用户执行下面任意一条命令，选择需要的渠道。安装后，`ml update` 只更新该渠道；已有安装不能通过另一条命令串渠道重装。
 
-在全新的 Linux VPS 上以 `root` 用户执行:
+### 稳定版（v1.26.15）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+```
+
+### 发行版（v1.26.16）
+
+```bash
+AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
 部署完成后，终端会输出 Web 管理后台地址，格式类似:
@@ -70,7 +77,7 @@ http://your_vps_ip:8787/随机安全后缀
 ml status    # 查看状态
 ml logs      # 查看实时日志
 ml node-log  # 查看节点切换与异常追踪日志
-ml update    # 更新到最新发行版（当前 v1.26.14）并重启服务
+ml update    # 更新到原安装渠道的新版本并重启服务
 ml restart   # 重启服务
 ```
 
@@ -88,12 +95,12 @@ ml restart   # 重启服务
 - 首次自动连接: 首次部署或已有缓存但没有活动连接时，会按当前路由模式测速排序，并自动连接符合规则的最低延迟节点。
 - 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按当前路由模式连接符合规则的最低延迟节点（固定 IP 模式不切换）。
 - 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序；当前连接节点若测速达标会保留并参与排序，仅在出现更低延迟节点时切换。
-- 终端一键更新: 新增 `ml update` 命令，可在服务器终端更新到最新发行版、重跑安装脚本并重启服务。
+- 终端一键更新: `ml update` 只更新原安装渠道，重跑本渠道安装脚本并重启服务。
 - 节点活动日志: 新增 `ml node-log` 命令，持续跟踪当前活动节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
   - 文件路径: `/opt/aimilivpn/vpngate_data/node_activity.log`
   - 主服务日志: `/opt/aimilivpn/vpngate_data/vpngate.log`
   - Web 日志面板 JSON: `/opt/aimilivpn/vpngate_data/logs/YYYY-MM-DD.json`
-- 新版本提示: Web UI 登录后会检测 GitHub 仓库中版本号最高的 `vX.Y.Z` 标签（发行版）；只有发布了比当前更新的版本标签时才提示，不会因为普通 commit 推送而提示。提示每天最多出现一次，文案为“有新的版本发布，可在终端中输入 ml update 命令更新”。
+- 新版本提示: Web UI 按本机APP_CHANNEL读取渠道清单，只提示本渠道的新版本，不会因为另一渠道版本更高而提示升级。
 - 高延迟触发刷新: 默认每 30 分钟检测当前已连接节点，只有延迟大于当前阈值才触发新一轮拉取、合并、测速、剔除。
 - 可调巡检策略: 在“代理设置”中可选择 5-60 分钟巡检间隔，以及 200-1000ms 延迟筛选阈值；修改后从保存时间重新计时，下次巡检生效。
 - 延迟过滤: 延迟大于当前阈值的普通节点会被剔除或标记不可用，默认阈值为 `500ms`。
@@ -117,6 +124,15 @@ ml restart   # 重启服务
 - 固定 IP: 锁定当前手动选择的节点，不会因为当前节点不可用而自动切换，但仍会定期测速并刷新候选节点列表。
 - 固定地区: 只在指定国家/地区和 IP 类型范围内测速排序，并选择最低延迟节点。
 - 固定收藏菜单: 只在收藏节点中测速排序并选择最低延迟节点；如果收藏节点全部不可用，是否回退到非收藏节点由收藏管理面板选项决定。
+
+### 渠道隔离
+
+- 稳定版只能自动更新到新的稳定版；发行版只能自动更新到新的发行版。首次安装默认稳定版；首次选择发行版可设置 `AIMILI_CHANNEL=release`。已有安装拒绝利用该变量或另一渠道标签串渠道重装。
+- 本机渠道记录位于 `vpngate_data/update_channel.json`，代码同时带有 `APP_CHANNEL`。远端 `release_channels.json` 为两渠道分别指定版本，不以全局最大版本号判断渠道。
+- 旧ml可能先把源码重置到main；新安装脚本通过ORIG_HEAD/reflog识别更新前的渠道，在生成服务/启动程序前恢复到本渠道目标。若记录不明、清单缺失或目标渠道不符，会停止，能确认旧提交时会恢复旧源码，不静默转到main。
+- 本次稳定版使用v1.26.15、发行版使用v1.26.16，因为v1.26.10等旧标签已发布，不可覆盖。渠道由元数据确定，与版本号数字大小无关。
+- 本地开发标记`.local_dev`会暂停自动更新/重装，保护当前代码；不会成为绕过渠道校验的入口。
+- 未修改已发布旧标签；旧版本未知来源且缺少可识别版本或Git更新记录时，不能保证自动识别，会明确停止。
 
 ## 网络调优与回退
 
@@ -161,22 +177,19 @@ firewall-cmd --reload
 ml update
 ```
 
-`ml update` 会拉取远程版本标签，对比本地版本与最新发行版，确认后切换到最新发行版并重新运行安装脚本、重启服务。旧版本的 `ml` 也可以直接使用该命令完成升级。
+`ml update` 会读取原安装渠道，只升级到同一渠道在release_channels.json中指定的标签。稳定版升级后仍是稳定版，发行版升级后仍是发行版；不会选取全局最高标签。旧ml先拉取main的历史行为由新安装脚本在启动服务前纠正。
 
-如需切换到指定版本（例如从发行版回退到稳定版），可设置环境变量后运行安装脚本:
+如需重新安装本渠道的指定新版本，可设置环境变量后运行安装脚本；已有安装不能借此跨渠道（下例适用于稳定版）:
 
 ```bash
-AIMILI_DEPLOY_REF=v1.26.9 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+AIMILI_DEPLOY_REF=v1.26.15 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
 ### 发布新版本（维护者）
 
-- **发布新的发行版**:
-  1. 修改 `vpngate_manager.py` 中的 `APP_VERSION`，例如 `1.26.11`。
-  2. 提交到 `main` 后打同名标签，并与 `main` 一起推送: `git tag -a v1.26.11 -m "v1.26.11" && git push origin main v1.26.11`。
-  3. `main` 的最新提交必须始终是最新发行版（旧版 `ml update` 会直接更新到 `main` 的最新提交），未发布的开发改动请放在其他分支。
-- **升级稳定版**: 当某个发行版经过充分验证后，把 `install.sh` 中的 `STABLE_TAG` 改为该版本标签（例如 `v1.26.10`），提交并推送 `main`。
-- 版本标签格式必须是 `vX.Y.Z`，旧的 `V2026.06.16` 这类日期标签不会被识别为版本。
+- 稳定版在stable分支维护，发行版在main分支维护；两边APP_CHANNEL必须分别为stable/release。
+- 选择未占用的新vX.Y.Z标签，修改APP_VERSION及release_channels.json对应条目。标签必须指向匹配渠道的代码，不能覆盖已发布标签。
+- main仍对应最新发行版标签；清单、分支和标签应原子推送，避免发布中间状态。旧ml兼容以安装脚本的更新前渠道恢复为准，不靠main代表所有渠道。
 
 如果系统不是 systemd，请使用安装脚本提供的 `ml` 菜单进行服务管理。
 
@@ -211,13 +224,21 @@ This repository is a modified version of AimiliVPN / aimili-vpngate.
 
 ## One-Click Installation
 
-Run as `root` on a fresh Linux VPS:
+Choose one command and run it as `root` on a fresh Linux VPS. Later updates stay on the selected channel.
+
+### Stable (v1.26.15)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-Release channels: the one-click installer deploys the **stable** version (currently `v1.26.9`, pinned by `STABLE_TAG` in `install.sh`); `ml update` upgrades an existing installation (including older versions) to the latest **release** tag (currently `v1.26.14`). Re-running the installer never downgrades a newer installation. The running version is shown at the top-left of the Web UI.
+### Release (v1.26.16)
+
+```bash
+AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+```
+
+Choose **stable v1.26.15** or **release v1.26.16** using the commands above. `ml update` stays on that installation's original channel and never selects the globally largest tag. Re-running the matching install command keeps the channel; the other command is rejected for existing installations. The Web UI shows the running version and channel.
 
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 
@@ -236,9 +257,9 @@ ml restart
 - Real egress latency testing through the active OpenVPN/local proxy path.
 - First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
 - After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node eligible under the current routing mode is connected (fixed IP mode does not switch).
-- Added `ml update` for upgrading to the latest release tag, rerunning the installer, and restarting the service.
+- `ml update` upgrades within the installed channel, reruns that channel's installer, and restarts the service.
 - Added `ml node-log` for tailing persistent node activity logs, including active node IP, switch time, switch failures, threshold stalls, and background thread crashes.
-- Web UI checks the latest GitHub Release tag, falling back to the latest tag, and shows an update notice only when a new tag is published; ordinary commits do not trigger the notice.
+- The Web UI reads the channel manifest and advertises updates only within its own channel.
 - Manual refresh merges old and new VPNGate candidates, then benchmarks and sorts them together.
 - Nodes above the configured latency threshold are marked unavailable or pruned, while favorites are preserved. The default threshold is `500ms`.
 - The active-node health-check interval and latency threshold are configurable in the proxy settings. Defaults are 30 minutes and `500ms`.

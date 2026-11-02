@@ -107,9 +107,10 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.14"
+APP_VERSION = "1.26.16"
+APP_CHANNEL = "release"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
-# 应用内新版本提示以最高的 vX.Y.Z 标签（即发行版）为准
+# 应用内新版本提示只读取release_channels.json中本渠道的版本
 STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -254,25 +255,17 @@ def stable_version_key(tag: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 def latest_github_version_ref() -> tuple[str, str, str]:
-    """返回远程最新发行版标签 (tag, commit_sha, 来源)。只认 vX.Y.Z 格式，按版本号而非字典序比较。"""
-    tags = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/tags?per_page=100")
-    if not isinstance(tags, list):
-        return "", "", ""
-    best: tuple[tuple[int, int, int], dict[str, Any]] | None = None
-    for item in tags:
-        if not isinstance(item, dict):
-            continue
-        key = stable_version_key(str(item.get("name") or ""))
-        if key is not None and (best is None or key > best[0]):
-            best = (key, item)
-    if best is None:
-        return "", "", ""
-    latest = best[1]
-    return (
-        str(latest.get("name") or ""),
-        str((latest.get("commit") or {}).get("sha") or ""),
-        "tag",
-    )
+    """Only advertise the version pinned for this installation's own channel."""
+    import base64
+    from update_channel import manifest_tag
+    result = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/contents/release_channels.json?ref=main")
+    manifest = json.loads(base64.b64decode(result["content"]).decode("utf-8"))
+    tag = manifest_tag(manifest, APP_CHANNEL)
+    commit = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/commits/{urllib.parse.quote(tag, safe='')}")
+    sha = str(commit.get("sha") or "")
+    if not sha:
+        raise ValueError("本渠道版本没有有效提交")
+    return tag, sha, "channel:" + APP_CHANNEL
 
 def check_version_notice() -> dict[str, Any]:
     today = time.strftime("%Y-%m-%d", time.localtime())
@@ -284,6 +277,7 @@ def check_version_notice() -> dict[str, Any]:
         "show_notice": False,
         "current_commit": current_commit,
         "current_tag": current_tag,
+        "current_channel": APP_CHANNEL,
         "current_version": APP_VERSION,
         "latest_tag": "",
         "latest_commit": "",
@@ -6915,7 +6909,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
                 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION).encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION + ("（稳定版）" if APP_CHANNEL == "stable" else "（发行版）")).encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
             global last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
