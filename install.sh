@@ -57,6 +57,14 @@ GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
+# Install/update channels are pinned by release_channels.json, never by the largest tag.
+INSTALL_DIR="/opt/aimilivpn"
+STABLE_TAG="v1.26.15"
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+LOCAL_RERUN=0
+if [ "${SELF_PATH}" = "${INSTALL_DIR}/install.sh" ]; then LOCAL_RERUN=1; fi
+
+if [ "${AIMILI_SOURCE_READY:-0}" != "1" ]; then
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
 if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
@@ -80,55 +88,39 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
 fi
 
-# 4. Clone or pull the repository
-INSTALL_DIR="/opt/aimilivpn"
-# 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
-DEFAULT_DEPLOY_BRANCH="main"
-
-# 自动检测本地已安装版本当前所在的分支
-CURRENT_BRANCH=""
-if [ -d "${INSTALL_DIR}/.git" ]; then
-    CURRENT_BRANCH=$(cd "${INSTALL_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
 fi
-DEPLOY_BRANCH="${CURRENT_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
 
-echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH})...${PLAIN}"
-if [ -f "${INSTALL_DIR}/.local_dev" ]; then
-    echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
-else
-    if [ -d "${INSTALL_DIR}" ]; then
-        echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
-        cd "${INSTALL_DIR}"
-        git fetch --all || true
-        git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
-        echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
-        if git reset --hard "origin/${DEPLOY_BRANCH}"; then
-            echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-        else
-            if git pull origin "${DEPLOY_BRANCH}"; then
-                echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-            else
-                echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
-            fi
+echo -e "\n${YELLOW}[2/4] 正在选择原安装渠道的版本...${PLAIN}"
+# Channel checks also protect development installs; no bypass to another channel.
+    FRESH_INSTALL=0
+    if [ -e "${INSTALL_DIR}/.git" ]; then
+        if [ "${AIMILI_SOURCE_READY:-0}" != "1" ]; then
+            git -C "${INSTALL_DIR}" fetch --tags origin \
+                refs/heads/main:refs/remotes/origin/main refs/heads/stable:refs/remotes/origin/stable
         fi
+    elif [ -d "${INSTALL_DIR}" ] && [ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]; then
+        echo -e "${RED}安装目录不是Git仓库，请先备份并核对。${PLAIN}"
+        exit 1
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (分支: ${DEPLOY_BRANCH}) ..."
-        if git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
-            echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
-        else
-            echo -e "  -> 尝试默认克隆..."
-            if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
-                cd "${INSTALL_DIR}"
-                git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
-                echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
-            else
-                echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
-                exit 1
-            fi
-        fi
+        git clone "${GITHUB_URL}" "${INSTALL_DIR}"
+        FRESH_INSTALL=1
     fi
-fi
-
+    CHANNEL_HELPER=$(mktemp)
+    trap 'rm -f "$CHANNEL_HELPER"' EXIT
+    git -C "${INSTALL_DIR}" show refs/remotes/origin/main:update_channel.py > "$CHANNEL_HELPER"
+    CHANNEL_ARGS=(prepare --repo "$INSTALL_DIR")
+    if [ "$FRESH_INSTALL" = "1" ]; then CHANNEL_ARGS+=(--fresh); fi
+    if [ "$LOCAL_RERUN" = "1" ]; then CHANNEL_ARGS+=(--legacy-local); fi
+    CHANNEL_STATUS=0
+    python3 "$CHANNEL_HELPER" "${CHANNEL_ARGS[@]}" || CHANNEL_STATUS=$?
+    rm -f "$CHANNEL_HELPER"
+    trap - EXIT
+    if [ "$CHANNEL_STATUS" = "10" ]; then
+        # The selected source may have a different installer. Handoff before touching services.
+        exec env AIMILI_SOURCE_READY=1 bash "$INSTALL_DIR/install.sh" "$GITHUB_USER" "$GITHUB_REPO"
+    elif [ "$CHANNEL_STATUS" != "0" ]; then
+        exit "$CHANNEL_STATUS"
+    fi
 # Persist conntrack tuning after checking out the selected source version.
 if [ "${AIMILI_CONNTRACK_TUNING:-1}" != "0" ] && [ -f "${INSTALL_DIR}/conntrack_tuning.py" ]; then
     echo -e "${YELLOW}正在配置连接跟踪表与本机回环规则...${PLAIN}"
@@ -549,64 +541,21 @@ def show_node_activity_logs():
         time.sleep(2)
 
 def update_service():
-    print("正在获取远程更新并检测版本...", flush=True)
-    if os.path.exists(INSTALL_DIR):
-        try:
-            os.chdir(INSTALL_DIR)
-            if not os.path.exists(".git"):
-                print("错误: 当前安装目录不是 Git 仓库，无法通过 Git 更新。")
-                time.sleep(3)
-                return
-            
-            # Fetch remote origin updates
-            subprocess.run(["git", "fetch", "--all"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # Detect remote branch (prefer current local branch, fallback to origin/main or origin/master)
-            curr = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
-            branch = curr.stdout.strip() if curr.returncode == 0 else ""
-            if not branch or branch == "HEAD":
-                branch = "main"
-                for b in ["main", "master"]:
-                    chk = subprocess.run(["git", "rev-parse", "--verify", f"origin/{b}"], capture_output=True, text=True)
-                    if chk.returncode == 0:
-                        branch = b
-                        break
-            
-            local_commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-            remote_commit = subprocess.run(["git", "rev-parse", f"origin/{branch}"], capture_output=True, text=True).stdout.strip()
-            
-            if local_commit == remote_commit:
-                print("\n【版本状态】当前已是最新版本，无需更新！")
-                override = input("是否强制重新拉取代码并覆盖安装？(y/N): ").strip().lower()
-                if override != 'y':
-                    print("已取消更新。")
-                    time.sleep(1.5)
-                    return
-            else:
-                print(f"\n【检测到更新】本地版本: {local_commit[:8]}，远程最新版本: {remote_commit[:8]}")
-                confirm = input("是否确认开始更新并重启服务？(Y/n): ").strip().lower()
-                if confirm not in ('', 'y', 'yes'):
-                    print("已取消更新。")
-                    time.sleep(1.5)
-                    return
-            
-            print(f"\n正在强制重置本地代码至 origin/{branch} ...", flush=True)
-            subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
-            mark_login_refresh_required("ml update")
-            
-            # Clean up python cache files
-            print("正在清理 Python 缓存 (pycache)...", flush=True)
-            subprocess.run(["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], check=False)
-            
-            print("代码拉取成功，正在重新运行安装脚本...", flush=True)
-            subprocess.run(["bash", "install.sh", "zhishixuebao-0791", "aimili-vpngate"])
-            print("更新已完成！")
-            time.sleep(2)
-        except Exception as e:
-            print(f"更新失败: {e}")
-            time.sleep(4)
-    else:
-        print(f"未找到安装目录: {INSTALL_DIR}")
+    print("正在检查原安装渠道的新版本...", flush=True)
+    try:
+        if not os.path.exists(os.path.join(INSTALL_DIR, ".git")):
+            print("安装目录不是Git仓库，停止更新。")
+            return
+        sys.path.insert(0, INSTALL_DIR)
+        from update_channel import Updater
+        if not Updater(INSTALL_DIR).update():
+            return
+        mark_login_refresh_required("ml update (same channel)")
+        subprocess.run(["bash", os.path.join(INSTALL_DIR, "install.sh"),
+                        "zhishixuebao-0791", "aimili-vpngate"], check=True)
+        print("本渠道更新已完成。")
+    except Exception as error:
+        print(f"更新未完成，未切换安装渠道: {error}")
         time.sleep(2)
 
 def uninstall_service():

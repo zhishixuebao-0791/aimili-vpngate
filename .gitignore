@@ -68,3 +68,5 @@ test_*.py
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+!tests/test_update_channel.py

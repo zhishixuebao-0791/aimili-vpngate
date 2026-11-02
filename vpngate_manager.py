@@ -107,7 +107,8 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.9"
+APP_VERSION = "1.26.15"
+APP_CHANNEL = "stable"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
@@ -235,26 +236,17 @@ def github_api_get(path: str, timeout: int = 3) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 def latest_github_version_ref() -> tuple[str, str, str]:
-    try:
-        release = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/releases/latest")
-        tag_name = str(release.get("tag_name") or "")
-        if tag_name:
-            commit = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/commits/{urllib.parse.quote(tag_name, safe='')}")
-            sha = str(commit.get("sha") or "")
-            if sha:
-                return tag_name, sha, "release"
-    except Exception:
-        pass
-
-    tags = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/tags?per_page=1")
-    if not isinstance(tags, list) or not tags:
-        return "", "", ""
-    latest = tags[0]
-    return (
-        str(latest.get("name") or ""),
-        str((latest.get("commit") or {}).get("sha") or ""),
-        "tag",
-    )
+    """Only advertise the version pinned for this installation's own channel."""
+    import base64
+    from update_channel import manifest_tag
+    result = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/contents/release_channels.json?ref=main")
+    manifest = json.loads(base64.b64decode(result["content"]).decode("utf-8"))
+    tag = manifest_tag(manifest, APP_CHANNEL)
+    commit = github_api_get(f"/repos/{UPDATE_REPO_OWNER}/{UPDATE_REPO_NAME}/commits/{urllib.parse.quote(tag, safe='')}")
+    sha = str(commit.get("sha") or "")
+    if not sha:
+        raise ValueError("本渠道版本没有有效提交")
+    return tag, sha, "channel:" + APP_CHANNEL
 
 def check_version_notice() -> dict[str, Any]:
     today = time.strftime("%Y-%m-%d", time.localtime())
@@ -266,6 +258,7 @@ def check_version_notice() -> dict[str, Any]:
         "show_notice": False,
         "current_commit": current_commit,
         "current_tag": current_tag,
+        "current_channel": APP_CHANNEL,
         "latest_tag": "",
         "latest_commit": "",
         "command": "ml update",
@@ -6936,7 +6929,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
                 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION).encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION + ("（稳定版）" if APP_CHANNEL == "stable" else "（发行版）")).encode("utf-8"), "text/html; charset=utf-8")
         elif effective_path == "/api/nodes":
             global last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
