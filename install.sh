@@ -59,7 +59,7 @@ GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 # Install/update channels are pinned by release_channels.json, never by the largest tag.
 INSTALL_DIR="/opt/aimilivpn"
-STABLE_TAG="v1.26.15"
+STABLE_TAG="v1.26.17"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 LOCAL_RERUN=0
 if [ "${SELF_PATH}" = "${INSTALL_DIR}/install.sh" ]; then LOCAL_RERUN=1; fi

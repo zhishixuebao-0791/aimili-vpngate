@@ -72,3 +72,7 @@ Thumbs.db
 Desktop.ini
 
 !tests/test_update_channel.py
+
+!tests/test_openvpn_recovery.py
+
+!tests/test_crl_cache.py

@@ -95,7 +95,7 @@ class CertificateCommandTests(unittest.TestCase):
             'get_openvpn_version':lambda:version,'os':__import__('os'),'Path':Path,
             'vpn_utils':Mock(is_config_tcp=Mock(return_value=False)), 'upstream_proxy_auth_file':lambda:None}
         exec(compile(ast.Module(body=[node],type_ignores=[]),'command','exec'),ns)
-        with patch('os.path.exists',return_value=True):return ns['openvpn_command']('unused-profile',True)
+        with patch('os.path.isdir',return_value=True):return ns['openvpn_command']('unused-profile',True)
 
     def test_modern_and_legacy_commands_require_server_certificate_role(self):
         for version in [2.4,2.5,2.6]:
@@ -104,6 +104,12 @@ class CertificateCommandTests(unittest.TestCase):
                 self.assertEqual(command[command.index('--remote-cert-tls')+1],'server')
                 self.assertIn('--capath',command);self.assertIn('--route-nopull',command)
                 self.assertNotIn('--verify-client-cert',command)
+
+    def test_explicit_crl_directory_keeps_ca_and_server_role_checks(self):
+        with patch.dict(os.environ,{'AIMILI_OPENVPN_CAPATH':'/private/crl-store'}):
+            command=self.command(2.6)
+        self.assertEqual(command[command.index('--capath')+1],'/private/crl-store')
+        self.assertEqual(command[command.index('--remote-cert-tls')+1],'server')
 
 
 if __name__=='__main__':unittest.main()

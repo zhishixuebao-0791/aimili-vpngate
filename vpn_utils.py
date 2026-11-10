@@ -964,6 +964,8 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
     if "tls error: tls key negotiation failed" in joined_log or "tls error: tls handshake failed" in joined_log:
         return 2006, "[ERR_OVPN_TLS_BLOCKED] TLS 握手超时/失败。原因: 可能是由于物理链路极差导致握手包丢失，或者受 VPS 防火墙规则/网络监管(如 GFW)深度包检测拦截了 OpenVPN 协议流量。"
         
+    if "no route to host" in joined_log or "network is unreachable" in joined_log:
+        return 2004, "[ERR_OVPN_NODE_UNREACHABLE] 无法到达 VPN 节点（No route to host / Network is unreachable）。请检查目标节点及该目标的网络可达性；这不等同于 VPS 整体断网。"
     if "connection timed out" in joined_log or "timeout" in joined_log:
         return 2004, "[ERR_OVPN_NODE_UNREACHABLE] 节点连接超时。原因: 远程节点已关机、VPS 本身出站流量被本地防火墙拦截，或者目的 IP:端口遭 ISP/GFW 屏蔽拦截。"
     if "connection refused" in joined_log:
@@ -976,6 +978,20 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
         return 2007, "[ERR_OVPN_ROUTE_NOPULL] 获取/解析 PUSH 配置参数冲突。原因: 某些推送选项在当前版本的客户端或配置环境中不可用。"
         
     return 2010, "[ERR_OVPN_UNKNOWN] OpenVPN 其他运行时异常。原因: 连接握手期间发生其他协议错误，详细信息请查看日志尾部。"
+
+
+def openvpn_startup_transport_failure(line: str) -> bool:
+    """Skip retry sleep after a conclusive, single-attempt TCP failure.
+
+    Do not match PUSH option warnings, CRL warnings, or replay/UDP messages.
+    The caller uses this only before initialization and with connect-retry-max 1.
+    """
+    lower = line.lower()
+    return "tcp: connect to " in lower and " failed:" in lower and any(
+        reason in lower for reason in (
+            "no route to host", "network is unreachable", "connection refused", "connection timed out"
+        )
+    )
 
 
 def port_listened_by_current_process(port: int) -> bool:
