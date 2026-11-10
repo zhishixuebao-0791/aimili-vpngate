@@ -16,19 +16,19 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本修改版保留源项目的部署脚本、OpenVPN 连接管理、Web 管理界面和本地代理网关能力，并围绕“真实出口延迟排序、低延迟节点保留、收藏/拉黑状态机、固定路由策略”做了定制。
 
-当前提供**稳定版 v1.26.15** 和**发行版 v1.26.16**，首次安装由用户自行选择，后续更新保持所选渠道。两者均包含IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优与回退。详见[更新记录](CHANGELOG.md)。
+当前提供**稳定版 v1.26.17** 和**发行版 v1.26.18**，首次安装由用户自行选择，后续更新保持所选渠道。两者均包含IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优与回退。详见[更新记录](CHANGELOG.md)。
 
 ## 一键部署
 
 在全新的 Linux VPS 上以 `root` 用户执行下面任意一条命令，选择需要的渠道。安装后，`ml update` 只更新该渠道；已有安装不能通过另一条命令串渠道重装。
 
-### 稳定版（v1.26.15）
+### 稳定版（v1.26.17）
 
 ```bash
 AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-### 发行版（v1.26.16）
+### 发行版（v1.26.18）
 
 ```bash
 AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
@@ -101,9 +101,13 @@ ml restart   # 重启服务
 - 首次安装由用户在上方两条一键部署命令中选择渠道。稳定版只更新到新的稳定版，发行版只更新到新的发行版；重装也保持原渠道。
 - 本机渠道记录位于 `vpngate_data/update_channel.json`，代码同时带有 `APP_CHANNEL`。远端 `release_channels.json` 为两渠道分别指定版本，不以全局最大版本号判断渠道。
 - 旧ml可能先把源码重置到main；新安装脚本通过ORIG_HEAD/reflog识别更新前的渠道，在生成服务/启动程序前恢复到本渠道目标。若记录不明、清单缺失或目标渠道不符，会停止，能确认旧提交时会恢复旧源码，不静默转到main。
-- 本次稳定版使用v1.26.15、发行版使用v1.26.16，因为v1.26.10等旧标签已发布，不可覆盖。渠道由元数据确定，与版本号数字大小无关。
+- 当前稳定版为v1.26.17，发行版为v1.26.18；已发布旧标签保持不变。渠道由元数据确定，与版本号数字大小无关。
 - 本地开发标记`.local_dev`会暂停自动更新/重装，保护当前代码；不会成为绕过渠道校验的入口。
 - 未修改已发布旧标签；旧版本未知来源且缺少可识别版本或Git更新记录时，不能保证自动识别，会明确停止。
+
+## 可选CRL缓存工具
+
+本次程序支持通过`AIMILI_OPENVPN_CAPATH`指定保留原CA信任的CRL目录。`ops/crl_cache.py`及[说明](ops/README.md)提供已验证的独立刷新工具源码；安装器不会自动启用，不会因为升级就强制所有免费出口缺CRL时拒绝连接。服务器端证书用途和CA检查继续保留。
 
 ## 网络调优与回退
 
@@ -193,13 +197,13 @@ This repository is a modified version of AimiliVPN / aimili-vpngate.
 
 Choose one command and run it as `root` on a fresh Linux VPS. Later updates stay on the selected channel.
 
-### Stable (v1.26.15)
+### Stable (v1.26.17)
 
 ```bash
 AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-### Release (v1.26.16)
+### Release (v1.26.18)
 
 ```bash
 AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate

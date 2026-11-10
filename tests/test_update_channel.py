@@ -13,6 +13,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = json.loads((ROOT / 'release_channels.json').read_text(encoding='utf-8'))
+STABLE_TAG = MANIFEST['stable']['tag']
+RELEASE_TAG = MANIFEST['release']['tag']
 spec = importlib.util.spec_from_file_location('channel', ROOT / 'update_channel.py')
 channel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(channel)
@@ -54,10 +57,14 @@ class ChannelTests(unittest.TestCase):
         for value in ['1.26.7', '1.26.8', '1.26.9']:
             version(value, 'stable')
         version('1.26.15', 'stable', True)
+        if STABLE_TAG != 'v1.26.15':
+            version(STABLE_TAG[1:], 'stable', True)
         git(source, 'switch', '-q', 'main')
         for value in ['1.26.10', '1.26.11', '1.26.12', '1.26.13', '1.26.14']:
             version(value, 'release')
         version('1.26.16', 'release', True)
+        if RELEASE_TAG != 'v1.26.16':
+            version(RELEASE_TAG[1:], 'release', True)
         cls.origin = cls.base / 'origin.git'
         subprocess.run(['git', 'clone', '-q', '--bare', str(source), str(cls.origin)], check=True)
 
@@ -118,27 +125,27 @@ class ChannelTests(unittest.TestCase):
     def test_new_updater_keeps_old_stable_on_stable(self):
         self.installed('v1.26.8')
         self.assertTrue(self.updater.update(confirm=lambda _: 'y'))
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_new_updater_keeps_old_release_on_release(self):
         self.installed('v1.26.14')
         self.assertTrue(self.updater.update(confirm=lambda _: 'y'))
-        self.assert_target('release', 'v1.26.16')
+        self.assert_target('release', RELEASE_TAG)
 
     def test_original_stable_ml_finally_installs_stable(self):
         self.installed('v1.26.9')
         self.old_update('stable')
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_original_stable_ml_from_detached_tag_keeps_stable(self):
         self.installed('v1.26.8', detached=True)
         self.old_update('stable')
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_original_release_ml_finally_installs_release(self):
         self.installed('v1.26.14', detached=True)
         self.old_update('release')
-        self.assert_target('release', 'v1.26.16')
+        self.assert_target('release', RELEASE_TAG)
 
     def test_all_known_old_versions_detect_their_own_channel(self):
         for version in range(6, 15):
@@ -151,7 +158,17 @@ class ChannelTests(unittest.TestCase):
         self.updater.save({'channel': 'stable', 'version': '1.26.15'})
         git(self.repo, 'reset', '--hard', 'origin/main')
         self.updater.prepare_install(legacy_local=True)
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
+
+    def test_previous_modern_stable_upgrades_within_stable(self):
+        self.installed('v1.26.15')
+        self.updater.update(confirm=lambda _: 'y')
+        self.assert_target('stable', STABLE_TAG)
+
+    def test_previous_modern_release_upgrades_within_release(self):
+        self.installed('v1.26.16')
+        self.updater.update(confirm=lambda _: 'y')
+        self.assert_target('release', RELEASE_TAG)
 
     def test_stable_cannot_request_release_tag(self):
         self.installed('v1.26.8')
@@ -172,16 +189,16 @@ class ChannelTests(unittest.TestCase):
 
     def test_fresh_install_defaults_to_stable(self):
         self.updater.prepare_install(fresh=True)
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_fresh_release_install_stays_release_on_reinstall(self):
         self.updater.prepare_install(fresh=True, requested_channel='release')
         self.updater.prepare_install(legacy_local=True)
-        self.assert_target('release', 'v1.26.16')
+        self.assert_target('release', RELEASE_TAG)
 
     def test_fresh_install_can_infer_channel_from_explicit_ref(self):
-        self.updater.prepare_install(fresh=True, requested_ref='v1.26.16')
-        self.assert_target('release', 'v1.26.16')
+        self.updater.prepare_install(fresh=True, requested_ref=RELEASE_TAG)
+        self.assert_target('release', RELEASE_TAG)
 
     def test_missing_channel_does_not_fall_back_to_largest_tag(self):
         with self.assertRaises(ValueError):
@@ -190,7 +207,7 @@ class ChannelTests(unittest.TestCase):
     def test_highest_global_tag_is_ignored(self):
         self.installed('v1.26.8')
         git(self.repo, 'tag', 'v99.0.0', 'origin/main')
-        self.assertEqual(self.updater.target(self.updater.identity())['tag'], 'v1.26.15')
+        self.assertEqual(self.updater.target(self.updater.identity())['tag'], STABLE_TAG)
 
     def test_unknown_legacy_channel_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -206,9 +223,9 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(git(self.repo, 'rev-parse', 'HEAD'), before)
 
     def test_latest_version_does_not_restart_or_replace_source(self):
-        self.installed('v1.26.15')
+        self.installed(STABLE_TAG)
         self.assertFalse(self.updater.update(confirm=lambda _: self.fail('No prompt expected')))
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_cancelled_update_leaves_original_source_and_channel_record(self):
         self.installed('v1.26.8')
@@ -232,7 +249,7 @@ class ChannelTests(unittest.TestCase):
         git(self.repo, 'reset', '--hard', 'origin/main')
         git(self.repo, 'reflog', 'expire', '--expire=now', '--all')
         self.updater.prepare_install(legacy_local=True)
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     def test_missing_all_legacy_history_does_not_assume_pulled_main_is_release(self):
         git(self.repo, 'reflog', 'expire', '--expire=now', '--all')
@@ -276,13 +293,13 @@ class ChannelTests(unittest.TestCase):
         self.installed('v1.26.8', detached=True)
         git(self.repo, 'reset', '--hard', 'origin/main')
         self.shell_selector(local=True)
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Real installer shell handoff is tested on Linux')
     def test_real_shell_reinstall_keeps_old_release_channel(self):
         self.installed('v1.26.14', detached=True)
         self.shell_selector(local=False)
-        self.assert_target('release', 'v1.26.16')
+        self.assert_target('release', RELEASE_TAG)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Real installer shell handoff is tested on Linux')
     def test_real_shell_fresh_install_defaults_to_stable(self):
@@ -290,11 +307,11 @@ class ChannelTests(unittest.TestCase):
         self.repo = Path(self.case.name) / 'fresh-install'
         self.updater = channel.Updater(self.repo)
         self.shell_selector(local=False)
-        self.assert_target('stable', 'v1.26.15')
+        self.assert_target('stable', STABLE_TAG)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Real deployment entries are tested on Linux')
     def test_real_shell_both_documented_deployment_entries_select_their_channel(self):
-        for choice, version in [('stable', 'v1.26.15'), ('release', 'v1.26.16')]:
+        for choice, version in [('stable', STABLE_TAG), ('release', RELEASE_TAG)]:
             with self.subTest(choice=choice):
                 self.repo = Path(self.case.name) / ('chosen-' + choice)
                 self.updater = channel.Updater(self.repo)
@@ -308,7 +325,7 @@ class VersionNoticeTests(unittest.TestCase):
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == 'latest_github_version_ref')
         manifest = json.loads((ROOT / 'release_channels.json').read_text())
         encoded = base64.b64encode(json.dumps(manifest).encode()).decode()
-        for kind, expected in [('stable', 'v1.26.15'), ('release', 'v1.26.16')]:
+        for kind, expected in [('stable', STABLE_TAG), ('release', RELEASE_TAG)]:
             def api(path):
                 return {'content': encoded} if '/contents/' in path else {'sha': 'checked-' + expected}
             namespace = {'github_api_get': api, 'APP_CHANNEL': kind, 'UPDATE_REPO_OWNER': 'tests',

@@ -1,5 +1,11 @@
 {
   "schema": 1,
-  "stable": {"branch": "stable", "tag": "v1.26.15"},
-  "release": {"branch": "main", "tag": "v1.26.16"}
+  "stable": {
+    "branch": "stable",
+    "tag": "v1.26.17"
+  },
+  "release": {
+    "branch": "main",
+    "tag": "v1.26.18"
+  }
 }

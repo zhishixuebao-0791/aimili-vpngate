@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.15"
+APP_VERSION = "1.26.17"
 APP_CHANNEL = "stable"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -1471,8 +1471,11 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
 
     command.extend(["--verb", "3"])
     
-    if os.path.exists("/etc/ssl/certs"):
-        command.extend(["--capath", "/etc/ssl/certs"])
+    ca_path = os.environ.get("AIMILI_OPENVPN_CAPATH", "/etc/ssl/certs")
+    if os.environ.get("AIMILI_OPENVPN_CAPATH") and not os.path.isdir(ca_path):
+        raise RuntimeError("Configured OpenVPN CA/CRL directory is unavailable")
+    if os.path.isdir(ca_path):
+        command.extend(["--capath", ca_path])
     
     try:
         content = Path(config_file).read_text(encoding="utf-8", errors="replace")
@@ -1623,6 +1626,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     started = time.time()
     tail: list[str] = []
     ok = False
+    transport_failed = False
     message = "OpenVPN did not complete initialization."
     while time.time() - started < limit:
         try:
@@ -1648,6 +1652,12 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         if "auth_failed" in lower or "authentication failed" in lower:
             message = "AUTH_FAILED"
             break
+        if vpn_utils.openvpn_startup_transport_failure(line):
+            # connect-retry-max=1 already bounds this attempt. Do not wait for
+            # OpenVPN's five-second restart sleep before choosing another node.
+            message = line[-220:]
+            transport_failed = True
+            break
         if "cannot ioctl" in lower or "fatal error" in lower:
             message = line[-220:]
             break
@@ -1664,7 +1674,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             level = "WARNING"
         log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
-    timed_out = is_probe_timeout_message(message)
+    timed_out = is_probe_timeout_message(message) and not transport_failed
     if not ok:
         if timed_out:
             message = f"[错误代码 1002] OpenVPN timeout after {limit}s. (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
