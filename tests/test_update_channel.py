@@ -57,12 +57,14 @@ class ChannelTests(unittest.TestCase):
         for value in ['1.26.7', '1.26.8', '1.26.9']:
             version(value, 'stable')
         version('1.26.15', 'stable', True)
+        version('1.26.17', 'stable', True)
         if STABLE_TAG != 'v1.26.15':
             version(STABLE_TAG[1:], 'stable', True)
         git(source, 'switch', '-q', 'main')
         for value in ['1.26.10', '1.26.11', '1.26.12', '1.26.13', '1.26.14']:
             version(value, 'release')
         version('1.26.16', 'release', True)
+        version('1.26.18', 'release', True)
         if RELEASE_TAG != 'v1.26.16':
             version(RELEASE_TAG[1:], 'release', True)
         cls.origin = cls.base / 'origin.git'
@@ -167,6 +169,16 @@ class ChannelTests(unittest.TestCase):
 
     def test_previous_modern_release_upgrades_within_release(self):
         self.installed('v1.26.16')
+        self.updater.update(confirm=lambda _: 'y')
+        self.assert_target('release', RELEASE_TAG)
+
+    def test_previous_stable_17_upgrades_within_stable(self):
+        self.installed('v1.26.17')
+        self.updater.update(confirm=lambda _: 'y')
+        self.assert_target('stable', STABLE_TAG)
+
+    def test_previous_release_18_upgrades_within_release(self):
+        self.installed('v1.26.18')
         self.updater.update(confirm=lambda _: 'y')
         self.assert_target('release', RELEASE_TAG)
 

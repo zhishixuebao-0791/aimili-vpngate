@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.18"
+APP_VERSION = "1.26.20"
 APP_CHANNEL = "release"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示只读取release_channels.json中本渠道的版本
@@ -671,6 +671,14 @@ def generate_random_username() -> str:
             if has_lower and has_upper and has_digit:
                 return uname
 
+def parse_int(value: Any) -> int:
+    # Configuration is read during module initialization, before later helpers.
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def load_ui_config() -> dict[str, Any]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -1027,12 +1035,6 @@ def clear_active_connection_state(message: str) -> None:
         active_node_latency="无活动连接",
         last_check_message=message,
     )
-
-def parse_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 def proxy_basic_auth_header(username: str, password: str) -> str:
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")

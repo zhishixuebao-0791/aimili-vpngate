@@ -76,3 +76,5 @@ Desktop.ini
 !tests/test_openvpn_recovery.py
 
 !tests/test_crl_cache.py
+!tests/test_openrc_supervision.py
+!tests/test_startup_listeners.py
