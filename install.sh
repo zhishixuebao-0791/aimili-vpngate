@@ -59,7 +59,7 @@ GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 # Install/update channels are pinned by release_channels.json, never by the largest tag.
 INSTALL_DIR="/opt/aimilivpn"
-STABLE_TAG="v1.26.17"
+STABLE_TAG="v1.26.19"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 LOCAL_RERUN=0
 if [ "${SELF_PATH}" = "${INSTALL_DIR}/install.sh" ]; then LOCAL_RERUN=1; fi
@@ -152,6 +152,10 @@ EOF
     systemctl daemon-reload
     systemctl enable aimilivpn.service
 elif command -v rc-service >/dev/null 2>&1; then
+    if ! command -v supervise-daemon >/dev/null 2>&1; then
+        echo -e "${RED}错误: 当前 OpenRC 缺少 supervise-daemon，无法保证配置变更后自动重启；原服务脚本保持不变。${PLAIN}"
+        exit 1
+    fi
     echo -e "  -> 检测到 OpenRC，正在创建服务配置 /etc/init.d/aimilivpn ..."
     cat > /etc/init.d/aimilivpn <<EOF
 #!/sbin/openrc-run
@@ -159,7 +163,10 @@ elif command -v rc-service >/dev/null 2>&1; then
 description="AimiliVPN OpenVPN Manager with HTTP/SOCKS5 Proxy"
 command="/usr/bin/python3"
 command_args="${INSTALL_DIR}/vpngate_manager.py"
-command_background="yes"
+# The manager stays in the foreground; supervise clean configuration-change exits too.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
 directory="${INSTALL_DIR}"
 pidfile="/run/aimilivpn.pid"
 
