@@ -2,10 +2,10 @@
   "schema": 1,
   "stable": {
     "branch": "stable",
-    "tag": "v1.26.19"
+    "tag": "v1.26.21"
   },
   "release": {
     "branch": "main",
-    "tag": "v1.26.20"
+    "tag": "v1.26.22"
   }
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import json
+import math
+from collections import deque
 import os
 import random
 import re
@@ -9,6 +11,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import threading
 from pathlib import Path
 from typing import Any
@@ -438,38 +441,77 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
         except Exception:
             pass
 
+class _IpInfoQueryGate:
+    """One process-wide budget; callers never sleep waiting for metadata."""
+
+    def __init__(self, clock=None):
+        self.clock = clock or time.monotonic
+        self.lock = threading.Lock()
+        self.requests = deque()
+        self.inflight = set()
+        self.retry_at = 0.0
+
+    def claim(self, ips):
+        with self.lock:
+            now = self.clock()
+            while self.requests and self.requests[0] <= now - 60:
+                self.requests.popleft()
+            if now < self.retry_at or len(self.requests) >= 15:
+                return []
+            claimed = [ip for ip in ips if ip not in self.inflight]
+            if claimed:
+                self.inflight.update(claimed)
+                self.requests.append(now)
+            return claimed
+
+    def observe(self, headers, limited=False):
+        def number(name):
+            try:
+                value = next(value for key, value in headers.items() if key.lower() == name.lower())
+                value = float(value)
+                return value if math.isfinite(value) and value >= 0 else None
+            except (StopIteration, TypeError, ValueError, AttributeError):
+                return None
+
+        remaining = number('X-Rl')
+        if not limited and remaining != 0:
+            return
+        ttl = number('X-Ttl')
+        retry_after = number('Retry-After')
+        delay = max([value for value in [ttl, retry_after] if value is not None] or [60])
+        with self.lock:
+            # Older concurrent responses must not clear a newer cooldown.
+            self.retry_at = max(self.retry_at, self.clock() + max(1, delay))
+
+    def release(self, ips):
+        with self.lock:
+            self.inflight.difference_update(ips)
+
+
+_ip_info_gate = _IpInfoQueryGate()
+_IP_INFO_FIELDS = ('owner', 'asn', 'as_name', 'location', 'ip_type', 'quality')
+
+
+def _ip_info_is_fresh(item, now):
+    try:
+        return isinstance(item, dict) and now - float(item.get('cached_at', 0)) < 7 * 24 * 3600
+    except (TypeError, ValueError):
+        return False
+
+
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
-    # 1. Read cache thread-safely
-    with ip_cache_lock:
-        cache = load_ip_cache()
-
-    ips_to_query = []
-    now = time.time()
-
-    for node in nodes:
-        ip = node.get("ip") or node.get("remote_host")
-        if not ip:
+    ips = list(dict.fromkeys(node.get('ip') or node.get('remote_host') for node in nodes))
+    ips = [ip for ip in ips if ip]
+    for i in range(0, len(ips), 100):
+        # Claim while the cache lock is held: another completed lookup cannot
+        # leave us querying an obsolete cache snapshot. HTTP holds neither lock.
+        with ip_cache_lock:
+            cache = load_ip_cache()
+            now = time.time()
+            missing = [ip for ip in ips[i:i + 100] if not _ip_info_is_fresh(cache.get(ip), now)]
+            chunk = _ip_info_gate.claim(missing)
+        if not chunk:
             continue
-        if ip in cache and now - cache[ip].get("cached_at", 0) < 7 * 24 * 3600:
-            cached = cache[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
-        else:
-            if ip not in ips_to_query:
-                ips_to_query.append(ip)
-
-    if not ips_to_query:
-        return
-
-    # 2. Perform HTTP query outside lock
-    new_entries = {}
-    chunk_size = 100
-    for i in range(0, len(ips_to_query), chunk_size):
-        chunk = ips_to_query[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
         request = urllib.request.Request(
             "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
@@ -479,16 +521,18 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
+                _ip_info_gate.observe(response.headers)
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
                 if not isinstance(data, list):
                     continue
+                new_entries = {}
                 for item in data:
                     if not isinstance(item, dict):
                         continue
                     if item.get("status") != "success":
                         continue
                     query_ip = item.get("query")
-                    if not query_ip:
+                    if query_ip not in chunk:
                         continue
 
                     ip_type = "residential"
@@ -514,31 +558,34 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                         "location": loc,
                         "ip_type": ip_type,
                         "quality": quality,
-                        "cached_at": now,
+                        "cached_at": time.time(),
                     }
+                if new_entries:
+                    # Publish before releasing claims, including when a second
+                    # caller began with a cold cache while this HTTP ran.
+                    with ip_cache_lock:
+                        cache = load_ip_cache()
+                        cache.update(new_entries)
+                        save_ip_cache(cache)
+        except urllib.error.HTTPError as error:
+            _ip_info_gate.observe(error.headers, limited=error.code == 429)
+            print(f"[enrich_ip_info] Query deferred: HTTP {error.code}", flush=True)
         except Exception as e:
             print(f"[enrich_ip_info] Query failed: {e}", flush=True)
+        finally:
+            _ip_info_gate.release(chunk)
 
-    if not new_entries:
-        return
-
-    # 3. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
+    # A cooldown is not a node failure. Keep known (even expired) metadata and
+    # leave unknown types unknown instead of relaxing residential/hosting rules.
     with ip_cache_lock:
         cache = load_ip_cache()
-        cache.update(new_entries)
-        save_ip_cache(cache)
-
-    # 4. Enrich nodes with newly queried info
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
-        if ip in new_entries:
-            cached = new_entries[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
+        cached = cache.get(ip)
+        if isinstance(cached, dict):
+            for key in _IP_INFO_FIELDS:
+                if cached.get(key) not in (None, ''):
+                    node[key] = cached[key]
 
 
 def load_purity_cache() -> dict[str, dict[str, Any]]:

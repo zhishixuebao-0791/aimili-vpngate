@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.19"
+APP_VERSION = "1.26.21"
 APP_CHANNEL = "stable"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -2230,7 +2230,7 @@ def timeout_probe_result(node_info: dict[str, Any], message: str | None = None) 
     mark_purity_disabled(result)
     return result
 
-def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
+def test_node_real_egress(node_info: dict[str, Any], purity_check: bool, enrich_metadata: bool = True) -> dict[str, Any]:
     node_id = str(node_info.get("id") or "")
     latency_threshold = get_latency_threshold_ms()
     probe_deadline = time.monotonic() + NODE_PROBE_TIMEOUT_SECONDS
@@ -2360,12 +2360,12 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         "probe_status": "available" if ok else "unavailable",
         "probe_message": message,
         "probed_at": time.time(),
-        "owner": "",
-        "asn": "",
-        "as_name": "",
-        "location": "",
-        "ip_type": "",
-        "quality": "",
+        "owner": node_info.get("owner", ""),
+        "asn": node_info.get("asn", ""),
+        "as_name": node_info.get("as_name", ""),
+        "location": node_info.get("location", ""),
+        "ip_type": node_info.get("ip_type", ""),
+        "quality": node_info.get("quality", ""),
         "egress_ip": egress_ip,
     }
     blacklisted_ip = manual_blacklist_match_for_node(result, manual)
@@ -2375,8 +2375,11 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         result["manual_blacklisted"] = True
         result["blacklisted_ip"] = blacklisted_ip
     mark_purity_disabled(result)
-    if ok and not blacklisted_ip:
-        vpn_utils.enrich_ip_info([result])
+    if ok and not blacklisted_ip and enrich_metadata:
+        try:
+            vpn_utils.enrich_ip_info([result])
+        except Exception as exc:
+            print(f"[Metadata] Query failed without changing probe status: {type(exc).__name__}", flush=True)
         # Purity scoring/filtering is intentionally disabled. Keep the old call
         # here commented for future rollback reference.
         # if purity_check:
@@ -2414,7 +2417,7 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         _, n_info = args
-        return test_node_real_egress(n_info, purity_check=False)
+        return test_node_real_egress(n_info, purity_check=False, enrich_metadata=False)
 
     updated_nodes_map = {}
     max_workers = min(5, max(1, len(to_test)))
