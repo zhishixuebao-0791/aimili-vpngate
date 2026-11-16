@@ -107,7 +107,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.20"
+APP_VERSION = "1.26.22"
 APP_CHANNEL = "release"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示只读取release_channels.json中本渠道的版本
@@ -2402,7 +2402,7 @@ def timeout_probe_result(node_info: dict[str, Any], message: str | None = None) 
     mark_purity_disabled(result)
     return result
 
-def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict[str, Any]:
+def test_node_real_egress(node_info: dict[str, Any], purity_check: bool, enrich_metadata: bool = True) -> dict[str, Any]:
     node_id = str(node_info.get("id") or "")
     latency_threshold = get_latency_threshold_ms()
     probe_deadline = time.monotonic() + NODE_PROBE_TIMEOUT_SECONDS
@@ -2535,12 +2535,12 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         "probe_status": "available" if ok else "unavailable",
         "probe_message": message,
         "probed_at": time.time(),
-        "owner": "",
-        "asn": "",
-        "as_name": "",
-        "location": "",
-        "ip_type": "",
-        "quality": "",
+        "owner": node_info.get("owner", ""),
+        "asn": node_info.get("asn", ""),
+        "as_name": node_info.get("as_name", ""),
+        "location": node_info.get("location", ""),
+        "ip_type": node_info.get("ip_type", ""),
+        "quality": node_info.get("quality", ""),
         "egress_ip": egress_ip,
     }
     blacklisted_ip = manual_blacklist_match_for_node(result, manual)
@@ -2551,7 +2551,7 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool) -> dict
         result["blacklisted_ip"] = blacklisted_ip
     settle_probe_failure_count(result, node_info, latency_threshold)
     mark_purity_disabled(result)
-    if ok and not blacklisted_ip:
+    if ok and not blacklisted_ip and enrich_metadata:
         # IP 信息补充失败不能影响测速结论，否则测速成功的节点会被误判为失败并计入冷却
         try:
             vpn_utils.enrich_ip_info([result])
@@ -2595,7 +2595,7 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         _, n_info = args
-        return test_node_real_egress(n_info, purity_check=False)
+        return test_node_real_egress(n_info, purity_check=False, enrich_metadata=False)
 
     updated_nodes_map = {}
     max_workers = min(5, max(1, len(to_test)))

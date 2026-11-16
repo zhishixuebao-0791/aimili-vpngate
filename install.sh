@@ -59,7 +59,7 @@ GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 # Install/update channels are pinned by release_channels.json, never by the largest tag.
 INSTALL_DIR="/opt/aimilivpn"
-STABLE_TAG="v1.26.19"
+STABLE_TAG="v1.26.21"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 LOCAL_RERUN=0
 if [ "${SELF_PATH}" = "${INSTALL_DIR}/install.sh" ]; then LOCAL_RERUN=1; fi
@@ -224,6 +224,8 @@ def load_ui_cfg():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("配置内容不是JSON对象")
                 for k, v in data.items():
                     cfg[k] = v
                 cfg.pop("_load_failed", None)
@@ -235,21 +237,37 @@ def load_ui_cfg():
 
 def save_ui_cfg(cfg):
     import json
+    import stat
+    import tempfile
     path = "/opt/aimilivpn/vpngate_data/ui_auth.json"
     if cfg.get("_load_failed"):
         print("错误: 读取现有配置失败，为避免覆盖已有设置，本次未保存。请稍后重试。")
         return False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.ml{os.getpid()}.tmp"
+    tmp = None
     try:
-        # 原子写入：先写临时文件再替换，避免服务进程读到写了一半的文件；
-        # 临时文件名带进程号，避免与服务进程的 ui_auth.json.tmp 冲突
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+        value = dict(cfg)
+        value.pop("_load_failed", None)
+        # Unique temporary files also avoid colliding with another writer.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=".ui_auth.ml-", suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            os.chmod(tmp, mode)
+            json.dump(value, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
         return True
-    except Exception:
+    except Exception as error:
+        print(f"错误: 配置未保存，请检查文件权限和磁盘状态 ({type(error).__name__})。")
         return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 def load_state():
     import json
@@ -667,7 +685,8 @@ def configure_web():
                 cfg['host'] = "::1"
             else:
                 cfg['host'] = "::"
-            save_ui_cfg(cfg)
+            if not save_ui_cfg(cfg):
+                return
             print(f"绑定地址已更新为: {cfg['host']}")
             ask_restart()
             break
@@ -675,7 +694,8 @@ def configure_web():
             print("\033[H\033[J", end="")
             new_path = generate_random_suffix()
             cfg['secret_path'] = new_path
-            save_ui_cfg(cfg)
+            if not save_ui_cfg(cfg):
+                return
             print("安全登录后缀已随机重置成功！")
             print(f"您的全新安全登录后缀为: {new_path}")
             display_host = cfg['host']
@@ -710,7 +730,8 @@ def configure_port():
                             time.sleep(2)
                             continue
                         cfg['port'] = port
-                        save_ui_cfg(cfg)
+                        if not save_ui_cfg(cfg):
+                            return
                         print(f"网页管理端口已更新为: {port}")
                         ask_restart()
                     else:
@@ -730,7 +751,8 @@ def configure_port():
                             time.sleep(2)
                             continue
                         cfg['proxy_port'] = port
-                        save_ui_cfg(cfg)
+                        if not save_ui_cfg(cfg):
+                            return
                         print(f"代理出站端口已更新为: {port}")
                         ask_restart()
                     else:
@@ -773,7 +795,8 @@ def configure_credentials():
                 continue
             cfg['username'] = new_uname
             cfg['password'] = new_pwd
-            save_ui_cfg(cfg)
+            if not save_ui_cfg(cfg):
+                return
             print("账号密码修改成功！")
             print(f"您的新管理账号: {new_uname}")
             print(f"您的新管理密码: {new_pwd}")
@@ -782,7 +805,8 @@ def configure_credentials():
             print("\033[H\033[J", end="")
             new_pwd = generate_random_password()
             cfg['password'] = new_pwd
-            save_ui_cfg(cfg)
+            if not save_ui_cfg(cfg):
+                return
             print("密码随机重置成功！")
             print(f"您的全新12位安全密码为: {new_pwd}")
             print("密码已保存在本地，不需要重启服务，刷新浏览器即可登录。")

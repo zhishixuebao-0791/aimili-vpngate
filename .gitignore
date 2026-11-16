@@ -78,3 +78,5 @@ Desktop.ini
 !tests/test_crl_cache.py
 !tests/test_openrc_supervision.py
 !tests/test_startup_listeners.py
+!tests/test_ip_info_queries.py
+!tests/test_ml_config_safety.py
