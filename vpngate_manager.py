@@ -108,7 +108,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.21"
+APP_VERSION = "1.26.23"
 APP_CHANNEL = "stable"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
