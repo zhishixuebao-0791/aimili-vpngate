@@ -87,7 +87,10 @@ ml restart   # 重启服务
 - 收藏菜单: 收藏节点后，即使后续延迟变高或不可用，也不会自动移出收藏，只能用户手动取消收藏。
 - 拉黑菜单: 支持持久拉黑 IP、搜索、添加、取消拉黑；被拉黑 IP 即使重新测速通过也保持不可用。
 - 拉黑保护: 如果意外连接到拉黑 IP，会立即断开并切换到当前列表中最低延迟的非拉黑可用节点。
-- 风险值列: 原第三方纯净度/API 风险过滤逻辑已停用，前端风险值固定显示 `60%`。
+- 风险值列显示 VPNGate 实际出口的等级、策略分、情报来源和最近核验时间。首次加载采用观察模式。服务环境变量 `AIMILI_RISK_MODE` 支持 `observe`（只评分）、`enforce`（拦截自动切换）和 `off`（关闭）。服务启动时读取该设置。
+- 系统从现有 `PROXYCHECK_API_KEY`、`ABUSEIPDB_API_KEY` 或 `API_Port.txt` 读取密钥，也支持可选的 `IPQS_API_KEY`。每次只查实际出口，后台优先核验活动节点和少量备用。手动测试单个节点也会刷新其出口评分。每个来源每天最多查询 900 次，复用 15 分钟内的有效数据。
+- 至少两个有效来源且未达滥用条件时为低风险（10）。滥用信号待复核时为 50 或 70，至少两家来源的滥用证据相互印证且含强信号时为高风险（90 或 100）。证据不足显示未验证。VPN 或机房身份只作参考。
+- 拦截模式只允许已核验的低风险出口自动切入，含启动恢复、收藏回退与固定节点重连。管理员可在界面确认后手动连接。正式隧道会再次验证公网出口后放行连接。如果旧连接已停而新出口核验失败，用户会经历中断。切换模式或首次加载代码需要安排维护窗口。
 - UI 增强: 增加延迟、风险值、物理位置、ASN、运营主体/ISP、网络质量、IP 类型等列。
 - 去广告: 已移除右侧 VPS 购买推荐广告。
 
@@ -241,7 +244,7 @@ ml restart
 - Added fixed region and fixed favorites failover logic.
 - Added persistent IP blacklist management.
 - Added favorite/blacklist UI rules.
-- Disabled third-party risk/purity filtering; risk is shown as fixed `60%`.
+- The risk column shows the observed VPN exit's reputation and supporting sources. Set the service environment variable `AIMILI_RISK_MODE` to `observe` (default), `enforce`, or `off` before startup. Enforced automatic connections require corroborated, current evidence and a second exit check on the connected tunnel. VPN and hosting classifications alone do not block an exit.
 - Added UI columns for latency, risk, location, ASN, ISP, network quality, and IP type.
 - Removed the VPS recommendation ad.
 

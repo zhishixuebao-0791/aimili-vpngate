@@ -21,6 +21,15 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+# Replaced atomically at tunnel transitions. None permits a manually selected or
+# unfiltered tunnel; an empty set holds new connections during verification.
+_tunnel_admission = (None,)
+
+
+def admit_tunnel(families):
+    global _tunnel_admission
+    _tunnel_admission = (None if families is None else frozenset(families),)
+
 # 同类失败日志限流：VPN 断开期间每个代理请求都会失败，逐条打印会把日志刷到上百 MB
 LOG_THROTTLE_SECONDS = parse_positive_int(os.environ.get("PROXY_LOG_THROTTLE_SECONDS"), 60)
 _log_throttle_lock = threading.Lock()
@@ -250,6 +259,10 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+    admission = _tunnel_admission
+    allowed = admission[0]
+    if allowed == frozenset():
+        raise OSError(errno.EAGAIN, "VPN exit verification pending")
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host)
     if resolved_ip:
@@ -264,12 +277,18 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
                        key=lambda row: row[0] != socket.AF_INET)
     for res in addresses:
         af, socktype, proto, canonname, sa = res
+        if allowed is not None and af not in allowed:
+            continue
+        if admission is not _tunnel_admission:
+            raise OSError(errno.EAGAIN, "VPN exit changed during connection")
         sock = None
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
             sock.connect(sa)
+            if admission is not _tunnel_admission:
+                raise OSError(errno.EAGAIN, "VPN exit changed during connection")
             return sock
         except OSError as e:
             err = e

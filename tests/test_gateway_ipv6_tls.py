@@ -95,6 +95,7 @@ class CertificateCommandTests(unittest.TestCase):
             'get_openvpn_version':lambda:version,'os':__import__('os'),'Path':Path,
             'vpn_utils':Mock(is_config_tcp=Mock(return_value=False)), 'upstream_proxy_auth_file':lambda:None}
         exec(compile(ast.Module(body=[node],type_ignores=[]),'command','exec'),ns)
+        ns['RISK_MODE'] = 'observe'
         with patch('os.path.isdir',return_value=True):return ns['openvpn_command']('unused-profile',True)
 
     def test_modern_and_legacy_commands_require_server_certificate_role(self):

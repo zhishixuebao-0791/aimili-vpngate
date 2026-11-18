@@ -215,6 +215,7 @@ class MetadataTests(unittest.TestCase):
         self.m.enrich_ip_info(nodes)
         f = manager_functions(['filter_routing_candidates'], {'load_manual_blacklist': lambda: {},
             'manual_blacklist_match_for_node': lambda *args: False, 'node_passes_current_latency': lambda node: True,
+            'auto_risk_allowed': lambda node: True,
             'country_matches': lambda *args: True, 'parse_int': lambda value: int(value or 0)})['filter_routing_candidates']
         for kind, expected in [('all', {'r','h','u'}), ('residential', {'r'}), ('hosting', {'h'})]:
             result = f(nodes, {'routing_mode': 'fixed_region', 'routing_ip_type': kind})
@@ -231,7 +232,7 @@ class ManagerBatchTests(unittest.TestCase):
             'mark_purity_disabled': lambda node: None, 'load_manual_blacklist': lambda: {},
             'apply_manual_blacklist_to_node': lambda *args: None, 'sort_all_nodes': lambda value: value,
             'write_json': Mock(), 'NODES_FILE': 'fixture', 'cleanup_favorite_node_ids': Mock()}
-        namespace.update(favorite_node_ids=lambda cfg: [], load_ui_config=lambda: {},
+        namespace.update(RISK_MODE='observe', favorite_node_ids=lambda cfg: [], load_ui_config=lambda: {},
                          NODE_TIMEOUT_LATENCY_MS=999999, parse_int=lambda value: int(value or 0))
         f = manager_functions(['test_multiple_nodes'], namespace)['test_multiple_nodes']
         result = f([node['id'] for node in nodes])

@@ -78,3 +78,4 @@ Desktop.ini
 !tests/test_startup_listeners.py
 !tests/test_ip_info_queries.py
 !tests/test_ml_config_safety.py
+!tests/test_exit_risk.py

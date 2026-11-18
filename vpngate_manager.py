@@ -79,6 +79,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import exit_risk
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -136,10 +137,79 @@ UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 NODE_LATENCY_LIMIT_MS = DEFAULT_LATENCY_THRESHOLD_MS
-PURITY_DISPLAY_FIXED_SCORE = 60
+RISK_MODE = os.environ.get("AIMILI_RISK_MODE", "observe").strip().lower()
+if RISK_MODE not in exit_risk.MODES:
+    raise ValueError("AIMILI_RISK_MODE must be observe, enforce or off")
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+
+
+def risk_key(provider):
+    if provider == "ipqs":
+        return os.environ.get("IPQS_API_KEY", "").strip()
+    keys = vpn_utils.get_abuseipdb_keys() if provider == "abuseipdb" else vpn_utils.get_proxycheck_keys()
+    return keys[0] if keys else ""
+
+
+risk_engine = exit_risk.RiskEngine(DATA_DIR / "exit_risk_v1.json", risk_key)
+
+
+def auto_risk_allowed(node):
+    return RISK_MODE != "enforce" or risk_engine.assess(node.get("egress_ip"))["auto_eligible"]
+
+
+def refresh_risk_pool(nodes, ui_cfg):
+    # Quota goes first to the active exit, fixed target, favourites and fastest backups.
+    if RISK_MODE == "off":
+        return
+    favorites = set(ui_cfg.get("favorite_node_ids", [])) if ui_cfg.get("routing_mode") in ("favorites", "fixed_favorites") else set()
+    pool = sorted((n for n in nodes if n.get("probe_status") == "available" or n.get("active")),
+                  key=lambda n: (not n.get("active"), ui_cfg.get("routing_mode") == "fixed_ip" and n.get("id") != ui_cfg.get("fixed_node_id"),
+                                 n.get("id") not in favorites,
+                                 ui_cfg.get("routing_mode") == "fixed_region" and not country_matches(n, ui_cfg.get("force_country")),
+                                 parse_int(n.get("latency_ms")) or 999999))
+    seen = set()
+    ready = 0
+    queried = 0
+    for node in pool:
+        ip = exit_risk.public_ip(node.get("egress_ip"))
+        if ip and ip not in seen:
+            seen.add(ip)
+            verdict = risk_engine.assess(ip)
+            if verdict["expires_at"] <= time.time() or (len(verdict["sources"]) < 2):
+                if queried >= 8:
+                    continue
+                verdict = risk_engine.assess(ip, refresh=True)
+                queried += 1
+            ready += int(verdict["auto_eligible"])
+            if ready >= 5:
+                break
+
+
+def refresh_exit_risk_loop():
+    while True:
+        try:
+            refresh_risk_pool(read_nodes(), load_ui_config())
+        except Exception as exc:
+            log_to_json("WARNING", "Risk", "出口信誉刷新失败 " + type(exc).__name__)
+        time.sleep(60)
+
+
+def verify_connected_exit(version):
+    # TLS authenticates the reflector. Numeric destination, no environment proxy,
+    # no global host routes. User connections remain held while this runs.
+    target = "1.1.1.1" if version == 4 else "[2606:4700:4700::1111]"
+    result = subprocess.run(["curl", "-q", "--silent", "--fail", "--noproxy", "*",
+                             "--interface", "tun0", "-" + str(version), "--max-time", "4",
+                             "https://" + target + "/cdn-cgi/trace"],
+                            capture_output=True, text=True, timeout=5)
+    ip = exit_risk.public_ip(parse_egress_ip_from_body(result.stdout, False)) if result.returncode == 0 else ""
+    if not ip or (":" in ip) != (version == 6):
+        raise exit_risk.RiskBlockedError("无法验证正式隧道的实际出口")
+    if ip in load_manual_blacklist() or not risk_engine.assess(ip, refresh=True)["auto_eligible"]:
+        raise exit_risk.RiskBlockedError("实际出口未通过风险核验")
+    return ip
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
@@ -1306,13 +1376,6 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
-        "purity_score": PURITY_DISPLAY_FIXED_SCORE,
-        "purity_raw_score": PURITY_DISPLAY_FIXED_SCORE,
-        "purity_grade": "disabled",
-        "purity_reasons": ["purity filter disabled"],
-        "purity_sources": ["disabled"],
-        "purity_checked_at": time.time(),
-        "purity_hard_block": False,
         "latency_ms": 0,
         "config_file": str(config_path),
         "config_text": config_text,
@@ -1495,6 +1558,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
     except Exception:
         pass
         
+    if dev == "tun0" and RISK_MODE == "enforce":
+        command.extend(["--remap-usr1", "SIGTERM"])
     if route_nopull:
         command.append("--route-nopull")
     return command
@@ -1734,6 +1799,8 @@ def cleanup_policy_routing() -> None:
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
+        if RISK_MODE == "enforce":
+            proxy_server.admit_tunnel(())
         cleanup_policy_routing()
         config_to_delete = None
         if active_openvpn_node_id:
@@ -1758,14 +1825,6 @@ def stop_active_openvpn() -> None:
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
 
-def mark_purity_disabled(node: dict[str, Any]) -> None:
-    node["purity_score"] = PURITY_DISPLAY_FIXED_SCORE
-    node["purity_raw_score"] = PURITY_DISPLAY_FIXED_SCORE
-    node["purity_grade"] = "disabled"
-    node["purity_reasons"] = ["purity filter disabled"]
-    node["purity_sources"] = ["disabled"]
-    node["purity_checked_at"] = time.time()
-    node["purity_hard_block"] = False
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
@@ -1933,6 +1992,7 @@ def connect_first_available_candidate(
             or node.get("manual_blacklisted")
             or manual_blacklist_match_for_node(node, manual)
             or not node_passes_current_latency(node)
+            or not auto_risk_allowed(node)
         ):
             continue
         ordered.append(node)
@@ -1963,6 +2023,10 @@ def connect_first_available_candidate(
             msg = f"{reason}; switched to {node_id}"
             set_state(last_check_message=msg)
             return True, msg
+        except exit_risk.RiskBlockedError as exc:
+            failures.append(str(exc))
+            log_to_json("WARNING", "Risk", str(exc))
+            continue
         except Exception as exc:
             fail_msg = f"{node_id}: {exc}"
             failures.append(fail_msg)
@@ -1973,7 +2037,10 @@ def connect_first_available_candidate(
     msg = f"{reason}; all {len(ordered)} candidates failed"
     if failures:
         msg = f"{msg}; last error: {failures[-1]}"
-    clear_active_connection_state(msg)
+    if not active_openvpn_running():
+        clear_active_connection_state(msg)
+    else:
+        set_state(last_check_message=msg)
     log_to_json("ERROR", "VPN", msg)
     return False, msg
 
@@ -2227,7 +2294,6 @@ def timeout_probe_result(node_info: dict[str, Any], message: str | None = None) 
         "quality": node_info.get("quality", ""),
         "egress_ip": "",
     }
-    mark_purity_disabled(result)
     return result
 
 def test_node_real_egress(node_info: dict[str, Any], purity_check: bool, enrich_metadata: bool = True) -> dict[str, Any]:
@@ -2271,7 +2337,6 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool, enrich_
         if active_blacklisted_ip:
             result["manual_blacklisted"] = True
             result["blacklisted_ip"] = active_blacklisted_ip
-        mark_purity_disabled(result)
         return result
 
     config_text = node_info.get("config_text") or ""
@@ -2374,16 +2439,11 @@ def test_node_real_egress(node_info: dict[str, Any], purity_check: bool, enrich_
         result["probe_message"] = f"Manual blacklist egress IP: {blacklisted_ip}"
         result["manual_blacklisted"] = True
         result["blacklisted_ip"] = blacklisted_ip
-    mark_purity_disabled(result)
     if ok and not blacklisted_ip and enrich_metadata:
         try:
             vpn_utils.enrich_ip_info([result])
         except Exception as exc:
             print(f"[Metadata] Query failed without changing probe status: {type(exc).__name__}", flush=True)
-        # Purity scoring/filtering is intentionally disabled. Keep the old call
-        # here commented for future rollback reference.
-        # if purity_check:
-        #     vpn_utils.assess_nodes_purity([result])
     return result
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
@@ -2395,6 +2455,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node_info = node.copy()
 
     tested = test_node_real_egress(node_info, purity_check=False)
+    if RISK_MODE != "off" and tested.get("probe_status") == "available":
+        risk_engine.assess(tested.get("egress_ip"), refresh=True)
 
     with lock:
         nodes = read_nodes()
@@ -2437,7 +2499,6 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
                     "latency_ms": NODE_TIMEOUT_LATENCY_MS if timeout_error else 0,
                     "egress_ip": "",
                 }
-                mark_purity_disabled(error_node)
                 updated_nodes_map[nid] = error_node
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
@@ -2445,13 +2506,11 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
     if successful_nodes:
         try:
             vpn_utils.enrich_ip_info(successful_nodes)
-            for node in successful_nodes:
-                mark_purity_disabled(node)
-            # Purity scoring/filtering is intentionally disabled. Keep the old
-            # call commented for future rollback reference.
-            # vpn_utils.assess_nodes_purity(successful_nodes)
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
+
+    if RISK_MODE == "enforce":
+        refresh_risk_pool([{**n, **updated_nodes_map.get(n.get("id"), {})} for n in to_test], load_ui_config())
 
     with lock:
         current_nodes = read_nodes()
@@ -2493,6 +2552,7 @@ def filter_routing_candidates(nodes: list[dict[str, Any]], ui_cfg: dict[str, Any
         n for n in nodes
         if n.get("probe_status") == "available"
         and not manual_blacklist_match_for_node(n, manual)
+        and auto_risk_allowed(n)
         and (not exclude_active or not n.get("active"))
         and node_passes_current_latency(n)
     ]
@@ -2754,6 +2814,9 @@ def auto_switch_node(attempt: int = 0) -> None:
         connect_first_available_candidate(candidates, msg)
         return
     else:
+        if RISK_MODE == "enforce" and active_openvpn_running():
+            set_state(last_check_message="当前没有通过规则的备用出口，保留活动连接")
+            return
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         if routing_mode == "fixed_region" and target_country:
             msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
@@ -2835,6 +2898,9 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
                 keep_unavailable_active_without_fallback = not favorite_available and bool(active_id)
             for node in tested_nodes:
                 if node.get("id") == active_id:
+                    if RISK_MODE == "enforce" and active_openvpn_running():
+                        node["active"] = True
+                        continue
                     node["latency_ms"] = max(parse_int(node.get("latency_ms")), latency_threshold + 1)
                     if not fixed_ip_mode and not keep_unavailable_active_without_fallback:
                         node["active"] = False
@@ -2847,11 +2913,11 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
                 elif not fixed_ip_mode:
                     node["active"] = False
 
-            if not fixed_ip_mode and active_id and not keep_unavailable_active_without_fallback:
+            if RISK_MODE != "enforce" and not fixed_ip_mode and active_id and not keep_unavailable_active_without_fallback:
                 stop_active_openvpn()
                 active_openvpn_node_id = ""
 
-            keep_ids = {active_id} if (fixed_ip_mode or keep_unavailable_active_without_fallback) and active_id else set()
+            keep_ids = {active_id} if (RISK_MODE == "enforce" or fixed_ip_mode or keep_unavailable_active_without_fallback) and active_id else set()
             pruned = prune_failed_nodes(tested_nodes, fav_ids, keep_ids=keep_ids)
             write_json(NODES_FILE, pruned)
 
@@ -2872,9 +2938,11 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
             ui_cfg["force_country"] = ""
             ui_cfg["routing_ip_type"] = "all"
         candidates = filter_routing_candidates(pruned, ui_cfg, exclude_active=False)
+        if RISK_MODE == "enforce" and active_id:
+            candidates = [n for n in candidates if n.get("id") != active_id]
         if not candidates:
             msg = "节点测速排序完成，但没有符合当前路由模式的可用节点"
-            set_state(active_openvpn_node_id="", is_connecting=False, last_check_message=msg, active_node_latency="无活动连接")
+            set_state(is_connecting=False, last_check_message=msg)
             return msg
 
         is_connecting = False
@@ -2891,7 +2959,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
         is_connecting = False
         maintenance_lock.release()
 
-def connect_node(node_id: str) -> str:
+def connect_node(node_id: str, *, manual_request: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     node_id = str(node_id or "").strip()
     if not node_id:
@@ -2912,6 +2980,9 @@ def connect_node(node_id: str) -> str:
         if not node:
             raise ValueError(f"Node not found: {node_id}")
         old_node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None) if active_openvpn_node_id else None
+        enforce = RISK_MODE == "enforce" and not manual_request
+        if enforce and not risk_engine.assess(node.get("egress_ip"), refresh=True)["auto_eligible"]:
+            raise exit_risk.RiskBlockedError("候选出口未通过风险核验，取消自动切换")
         if apply_manual_blacklist_to_node(node):
             write_json(NODES_FILE, nodes)
             raise RuntimeError(f"Node egress IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('egress_ip') or node.get('proxy_ip')}")
@@ -2968,6 +3039,24 @@ def connect_node(node_id: str) -> str:
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
+        if enforce:
+            try:
+                node["egress_ip"] = verify_connected_exit(4)
+                families = [socket.AF_INET]
+                verified = [node["egress_ip"]]
+                if proxy_server.tun0_supports_ipv6():
+                    verified.append(verify_connected_exit(6))
+                    families.append(socket.AF_INET6)
+                if any(not risk_engine.assess(ip)["auto_eligible"] for ip in verified):
+                    raise exit_risk.RiskBlockedError("正式放行前出口证据已过期")
+                if process.poll() is not None:
+                    raise exit_risk.RiskBlockedError("核验期间隧道已退出")
+                proxy_server.admit_tunnel(families)
+            except Exception as exc:
+                stop_active_openvpn()
+                raise exit_risk.RiskBlockedError("连接后出口核验失败，已停止候选隧道：" + str(exc)) from exc
+        elif RISK_MODE == "enforce":
+            proxy_server.admit_tunnel(None)
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -3027,7 +3116,8 @@ def connect_node(node_id: str) -> str:
                 proxy_latency_ms=proxy_latency,
                 proxy_error=""
             )
-            node["egress_ip"] = proxy_ip or res.get("ip", "")
+            if not enforce:
+                node["egress_ip"] = proxy_ip or res.get("ip", "")
         else:
             proxy_error = res.get("error", "proxy health check failed")
             with lock:
@@ -5013,11 +5103,13 @@ function latencyCell(ms) {
 }
 
 function riskDisplay(n) {
-  return {
-    text: "60%",
-    cls: "latency-good",
-    title: "纯净度过滤已关闭，风险值固定显示 60%"
-  };
+  const r = n.exit_risk || {};
+  const levels = {low:"低风险", review:"待复核", high:"高风险", unknown:"未验证", off:"已关闭"};
+  const mode = {observe:"观察模式", enforce:"拦截模式", off:"已关闭"}[state.exit_risk_mode];
+  const time = r.checked_at ? new Date(r.checked_at * 1000).toLocaleString() : "";
+  return {text: (levels[r.level] || "未验证") + (r.score == null ? "" : " " + r.score),
+    cls: {low:"latency-good", high:"latency-poor", review:"latency-medium"}[r.level] || "",
+    title: [mode, ...(r.reasons || []), (r.sources || []).join(", "), time].filter(Boolean).join(" · ")};
 }
 
 function updateCountryFilter() {
@@ -5467,6 +5559,9 @@ function startConnectionPolling() {
 }
 
 async function connectNode(id){
+  const selected = nodes.find(n => n.id === id);
+  if (state.exit_risk_mode === "enforce" && !selected?.exit_risk?.auto_eligible &&
+      !confirm("该出口未通过自动切换的风险核验。仍然手动连接？")) return;
   state.is_connecting = true;
   state.active_openvpn_node_id = id;
   state.active_node_latency = "正在连接";
@@ -6963,10 +7058,14 @@ class Handler(BaseHTTPRequestHandler):
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()
+                for old_field in [k for k in stripped if k.startswith("purity_")]:
+                    stripped.pop(old_field)
+                stripped["exit_risk"] = (risk_engine.assess(n.get("egress_ip")) if RISK_MODE != "off"
+                                         else {"level": "off", "score": None})
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+            self.send_json({"nodes": stripped_nodes, "state": {**get_state(), "exit_risk_mode": RISK_MODE}})
         elif effective_path == "/api/version_check":
             self.send_json(check_version_notice())
         elif effective_path == "/api/manual_blacklist":
@@ -7493,7 +7592,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/connect":
             try:
                 payload = self.read_json_body()
-                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""), manual_request=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
@@ -7569,6 +7668,8 @@ class Tee:
         return getattr(self.stdout, attr)
 
 def main() -> None:
+    if RISK_MODE == "enforce":
+        proxy_server.admit_tunnel(())
     ensure_dirs()
     install_crash_log_hooks()
     log_node_activity("START", "AimiliVPN service starting")
@@ -7641,6 +7742,8 @@ def main() -> None:
         print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
 
     threading.Thread(target=collector_loop, daemon=True).start()
+    if RISK_MODE != "off":
+        threading.Thread(target=refresh_exit_risk_loop, name="exit-risk", daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     threading.Thread(target=active_latency_refresh_guard, daemon=True).start()
