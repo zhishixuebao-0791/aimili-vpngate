@@ -43,7 +43,7 @@ Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版�
   - 修复本机代理端口被本服务自己监听时误报"端口被其他进程占用"（ERR_PORT_IN_USE），本机代理网关故障不再拉黑正常节点、不再触发切换；本地端口偶发超时先重试一次，并在提示中保留原始错误。
   - 代理失败日志按同类错误限流（每类 60 秒打印 1 条，附省略条数）；`vpngate.log` 超过 20MB（`LOG_FILE_MAX_BYTES`）自动轮转为 `vpngate.log.1`，`ml` 查看日志改为 `tail -F` 以跟随轮转。
 - **v1.26.11**
-  - 不可用节点统一清理：除超时（-1）外，其他失败（显示 `-`）也计入连续失败并进入阶梯冷却（30 分钟 / 2 小时 / 6 小时 / 24 小时）；连续失败 4 次或已从 VPNGate 下线的节点自动移出列表，避免死节点无限堆积、拖慢测速。
+  - 不可达、拒绝连接或认证失败且延迟显示 `-` 的节点保留在列表，继续进入阶梯冷却（30 分钟 / 2 小时 / 6 小时 / 24 小时）并等待重试。超时显示 `-1`，沿用连续失败或下线后的清理规则。列表仍有容量上限。
   - 节点数超过上限时优先丢弃不可用节点，保证新节点能进入列表。
   - 已下线的拉黑节点从列表移除（拉黑 IP 清单本身不受影响）。
   - 切换到固定 IP 模式时锁定当前连接的节点。
@@ -266,7 +266,7 @@ ml restart
 
 - Real egress latency testing through the active OpenVPN/local proxy path.
 - First-login automatic benchmark, sorting, and connection to the lowest-latency eligible node.
-- After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh; old and new nodes are benchmarked together, unavailable nodes are pruned, and the lowest-latency node eligible under the current routing mode is connected (fixed IP mode does not switch).
+- After a fresh install or `ml update`, the first Web UI login triggers a VPNGate refresh. Nodes with no latency result after a failed connection remain eligible for later probes after cooldown. Timeout pruning and the list size limit still apply.
 - `ml update` upgrades within the installed channel, reruns that channel's installer, and restarts the service.
 - Added `ml node-log` for tailing persistent node activity logs, including active node IP, switch time, switch failures, threshold stalls, and background thread crashes.
 - The Web UI reads the channel manifest and advertises updates only within its own channel.

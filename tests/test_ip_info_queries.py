@@ -221,6 +221,20 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual({node['id'] for node in result}, expected)
 
 
+class ReleaseRetentionTests(unittest.TestCase):
+    def test_no_latency_failures_remain_after_retry_limit_and_unfavorite(self):
+        names = ['has_failure_without_latency', 'failed_node_should_be_dropped', 'node_delisted',
+                 'node_should_be_removed_after_unfavorite']
+        ctx = manager_functions(names, {'get_latency_threshold_ms':lambda:500,
+            'parse_int':lambda n:int(n or 0), 'NODE_TIMEOUT_MAX_FAILS':4, 'NODE_TIMEOUT_LATENCY_MS':-1})
+        rejected = {'id':'candidate','probe_status':'unavailable','latency_ms':0,'timeout_fail_count':8}
+        self.assertFalse(ctx['failed_node_should_be_dropped'](rejected, set()))
+        self.assertFalse(ctx['node_should_be_removed_after_unfavorite'](rejected))
+        timed_out = dict(rejected, latency_ms=-1)
+        self.assertTrue(ctx['failed_node_should_be_dropped'](timed_out, set()))
+        self.assertTrue(ctx['node_should_be_removed_after_unfavorite'](timed_out))
+
+
 class ManagerBatchTests(unittest.TestCase):
     def test_workers_skip_metadata_and_one_bulk_query_preserves_node_status(self):
         nodes = [{'id': str(i), 'ip': '192.0.2.'+str(i+1)} for i in range(5)]

@@ -1875,8 +1875,14 @@ def node_delisted(node: dict[str, Any], fresh_ids: set[str] | None) -> bool:
     """节点已不在 VPNGate 最新拉取的列表中（已下线）。fresh_ids 为 None 表示本轮未拉取，无法判断。"""
     return fresh_ids is not None and str(node.get("id") or "") not in fresh_ids
 
+def has_failure_without_latency(node: dict[str, Any]) -> bool:
+    return node.get("probe_status") == "unavailable" and parse_int(node.get("latency_ms")) == 0
+
+
 def failed_node_should_be_dropped(node: dict[str, Any], fresh_ids: set[str] | None = None) -> bool:
-    """不可用节点（超时或其他失败）是否应剔除：连续失败次数耗尽，或已从 VPNGate 下线。"""
+    """无延迟的失败留在列表重试。其他失败按原重试次数和 VPNGate 列表清理。"""
+    if has_failure_without_latency(node):
+        return False
     if parse_int(node.get("timeout_fail_count")) >= NODE_TIMEOUT_MAX_FAILS:
         return True
     return node_delisted(node, fresh_ids)
@@ -1913,7 +1919,7 @@ def prune_failed_nodes(
             continue
         status = node.get("probe_status")
         if status == "unavailable":
-            # 超时（-1）与非超时失败（-）统一处理：进入阶梯冷却，连续失败次数耗尽或已下线时剔除
+            # 两类失败均进入阶梯冷却；无延迟的失败保留供后续重试。
             if not node.get("cooldown_until"):
                 mark_node_failure_cooldown(
                     node,
@@ -1958,7 +1964,7 @@ def node_passes_current_latency(node: dict[str, Any] | None) -> bool:
     return latency > 0 and latency <= threshold
 
 def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool:
-    if not node:
+    if not node or has_failure_without_latency(node):
         return False
     threshold = get_latency_threshold_ms()
     latency = parse_int(node.get("latency_ms"))
@@ -2760,8 +2766,7 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
                 keep_ids.add(active_id)
             if routing_mode == "fixed_ip" and ui_cfg.get("fixed_node_id"):
                 keep_ids.add(str(ui_cfg.get("fixed_node_id")))
-            # 与 prune_failed_nodes 保持一致：不可用节点（超时或其他失败）进入阶梯冷却保留，
-            # 仅连续失败次数耗尽才剔除；拉黑节点保留以持续显示不可用
+            # 与 prune_failed_nodes 一致，无延迟的失败留在列表；其他失败保留原清理条件。
             tested_nodes = [
                 node for node in tested_nodes
                 if not (
