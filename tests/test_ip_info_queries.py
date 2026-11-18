@@ -233,6 +233,8 @@ class ManagerBatchTests(unittest.TestCase):
             'apply_manual_blacklist_to_node': lambda *args: None, 'sort_all_nodes': lambda value: value,
             'write_json': Mock(), 'NODES_FILE': 'fixture', 'cleanup_favorite_node_ids': Mock()}
         namespace.update(RISK_MODE='observe', favorite_node_ids=lambda cfg: [], load_ui_config=lambda: {},
+                         apply_probe_result=lambda node, result: node.update(result),
+                         cleanup_probe_results=lambda nodes, cfg, ids: nodes,
                          NODE_TIMEOUT_LATENCY_MS=999999, parse_int=lambda value: int(value or 0))
         f = manager_functions(['test_multiple_nodes'], namespace)['test_multiple_nodes']
         result = f([node['id'] for node in nodes])

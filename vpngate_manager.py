@@ -137,7 +137,7 @@ UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 NODE_LATENCY_LIMIT_MS = DEFAULT_LATENCY_THRESHOLD_MS
-RISK_MODE = os.environ.get("AIMILI_RISK_MODE", "observe").strip().lower()
+RISK_MODE = os.environ.get("AIMILI_RISK_MODE", "enforce").strip().lower()
 if RISK_MODE not in exit_risk.MODES:
     raise ValueError("AIMILI_RISK_MODE must be observe, enforce or off")
 
@@ -155,8 +155,35 @@ def risk_key(provider):
 risk_engine = exit_risk.RiskEngine(DATA_DIR / "exit_risk_v1.json", risk_key)
 
 
+def node_risk(node):
+    addresses = dict.fromkeys(node.get(field) for field in ("egress_ip", "risk_exit_ipv4", "risk_exit_ipv6"))
+    verdict = None
+    for address in addresses:
+        if not address:
+            continue
+        current = risk_engine.assess(address)
+        if current["level"] == "high":
+            return current
+        if verdict is None:
+            verdict = current
+    return verdict if verdict is not None else risk_engine.assess(None)
+
+
+def remember_risk_exit(node, ip):
+    ip = exit_risk.public_ip(ip)
+    if ip:
+        node["risk_exit_ipv6" if ":" in ip else "risk_exit_ipv4"] = ip
+
+
+def apply_probe_result(node, tested):
+    # A failed reprobe must not erase a previously identified exit.
+    remember_risk_exit(node, node.get("egress_ip"))
+    node.update(tested)
+    remember_risk_exit(node, tested.get("egress_ip"))
+
+
 def auto_risk_allowed(node):
-    return RISK_MODE != "enforce" or risk_engine.assess(node.get("egress_ip"))["auto_eligible"]
+    return RISK_MODE != "enforce" or node_risk(node)["level"] != "high"
 
 
 def refresh_risk_pool(nodes, ui_cfg):
@@ -182,7 +209,7 @@ def refresh_risk_pool(nodes, ui_cfg):
                     continue
                 verdict = risk_engine.assess(ip, refresh=True)
                 queried += 1
-            ready += int(verdict["auto_eligible"])
+            ready += int(verdict["level"] == "low")
             if ready >= 5:
                 break
 
@@ -207,9 +234,36 @@ def verify_connected_exit(version):
     ip = exit_risk.public_ip(parse_egress_ip_from_body(result.stdout, False)) if result.returncode == 0 else ""
     if not ip or (":" in ip) != (version == 6):
         raise exit_risk.RiskBlockedError("无法验证正式隧道的实际出口")
-    if ip in load_manual_blacklist() or not risk_engine.assess(ip, refresh=True)["auto_eligible"]:
-        raise exit_risk.RiskBlockedError("实际出口未通过风险核验")
     return ip
+
+
+def verify_automatic_tunnel(node):
+    versions = [(4, socket.AF_INET)]
+    if proxy_server.tun0_supports_ipv6():
+        versions.append((6, socket.AF_INET6))
+    verified = []
+    try:
+        for version, _ in versions:
+            ip = verify_connected_exit(version)
+            verified.append(ip)
+            remember_risk_exit(node, ip)
+            if version == 4:
+                node["egress_ip"] = ip
+            if ip in load_manual_blacklist() or risk_engine.assess(ip, refresh=True)["level"] == "high":
+                raise exit_risk.RiskBlockedError("正式隧道的出口已确认高风险或命中手动拉黑")
+        return [family for _, family in versions], verified
+    finally:
+        if verified:
+            with lock:
+                nodes = read_nodes()
+                for saved in nodes:
+                    if saved.get("id") == node["id"]:
+                        for ip in verified:
+                            remember_risk_exit(saved, ip)
+                            if ":" not in ip:
+                                saved["egress_ip"] = ip
+                        write_json(NODES_FILE, nodes)
+                        break
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
@@ -1885,12 +1939,6 @@ def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep
     for node in nodes:
         node_id = str(node.get("id") or "")
         latency = parse_int(node.get("latency_ms"))
-        protected = node_id in favorite_ids or node_id in keep_ids
-        if protected:
-            kept.append(node)
-            continue
-        if latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold:
-            continue
         egress_blacklisted = bool(manual_blacklist_match_for_node(node, manual) or node.get("manual_blacklisted"))
         if egress_blacklisted:
             node["active"] = False
@@ -1899,10 +1947,8 @@ def prune_failed_nodes(nodes: list[dict[str, Any]], favorite_ids: set[str], keep
             node["probe_message"] = node.get("probe_message") or "Manual blacklist egress IP"
             kept.append(node)
             continue
-        if (
-            node.get("probe_status") == "available"
-            or node.get("probe_status") == "unavailable"
-        ):
+        protected = node_id in favorite_ids or node_id in keep_ids or protect_node_from_cleanup(node)
+        if protected or (node.get("probe_status") == "available" and 0 < latency <= threshold):
             kept.append(node)
     return sort_all_nodes(kept)
 
@@ -1913,12 +1959,36 @@ def node_passes_current_latency(node: dict[str, Any] | None) -> bool:
     latency = parse_int(node.get("latency_ms"))
     return latency > 0 and latency <= threshold
 
-def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None) -> bool:
-    if not node:
+def node_should_be_removed_after_unfavorite(node: dict[str, Any] | None, threshold=None) -> bool:
+    if not node or protect_node_from_cleanup(node):
         return False
-    threshold = get_latency_threshold_ms()
+    if threshold is None:
+        threshold = get_latency_threshold_ms()
     latency = parse_int(node.get("latency_ms"))
-    return latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold
+    return node.get("probe_status") == "unavailable" or latency == NODE_TIMEOUT_LATENCY_MS or latency > threshold
+
+
+def protect_node_from_cleanup(node):
+    return (node.get("active") or node.get("id") == active_openvpn_node_id
+            or node.get("manual_blacklisted") or node_risk(node)["level"] == "high")
+
+
+def cleanup_probe_results(nodes, ui_cfg, tested_ids=None):
+    protected_ids = set(favorite_node_ids(ui_cfg))
+    if ui_cfg.get("fixed_node_id"):
+        protected_ids.add(ui_cfg["fixed_node_id"])
+    threshold = get_latency_threshold_ms(ui_cfg)
+    return [n for n in nodes if (tested_ids is not None and n.get("id") not in tested_ids)
+            or n.get("id") in protected_ids or not node_should_be_removed_after_unfavorite(n, threshold)]
+
+
+def cap_nodes_preserving_high_risk(nodes, limit=1000):
+    if len(nodes) <= limit:
+        return nodes
+    protected, other = [], []
+    for node in nodes:
+        (protected if protect_node_from_cleanup(node) else other).append(node)
+    return protected + other[:max(0, limit - len(protected))]
 
 def remove_nodes_by_ids(node_ids: set[str]) -> None:
     if not node_ids:
@@ -1969,7 +2039,8 @@ def mark_node_connect_failed(node_id: str, message: str) -> None:
             changed = True
             break
         if changed:
-            write_json(NODES_FILE, sort_all_nodes(nodes))
+            cleaned = cleanup_probe_results(nodes, load_ui_config(), {node_id})
+            write_json(NODES_FILE, sort_all_nodes(cleaned))
 
 def connect_first_available_candidate(
     candidates: list[dict[str, Any]],
@@ -2462,9 +2533,9 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
-            node.update({k: v for k, v in tested.items() if k != "id"})
+            apply_probe_result(node, {k: v for k, v in tested.items() if k != "id"})
             apply_manual_blacklist_to_node(node)
-            sorted_nodes = sort_all_nodes(nodes)
+            sorted_nodes = sort_all_nodes(cleanup_probe_results(nodes, load_ui_config(), {node_id}))
             write_json(NODES_FILE, sorted_nodes)
             cleanup_favorite_node_ids(sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -2518,15 +2589,10 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
         for n in current_nodes:
             nid = n.get("id")
             if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
+                apply_probe_result(n, updated_nodes_map[nid])
             apply_manual_blacklist_to_node(n, manual)
         if cleanup_favorites:
-            fav_ids = set(favorite_node_ids(load_ui_config()))
-            current_nodes = [
-                n for n in current_nodes
-                if parse_int(n.get("latency_ms")) != NODE_TIMEOUT_LATENCY_MS
-                or str(n.get("id") or "") in fav_ids
-            ]
+            current_nodes = cleanup_probe_results(current_nodes, load_ui_config(), updated_nodes_map.keys())
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
         if cleanup_favorites:
@@ -2647,15 +2713,7 @@ def test_current_routing_scope_and_maybe_switch(reason: str) -> str:
             keep_ids: set[str] = set()
             if routing_mode == "fixed_ip" and active_id:
                 keep_ids.add(active_id)
-            tested_nodes = [
-                node for node in tested_nodes
-                if not (
-                    str(node.get("id") or "") in scope_ids
-                    and parse_int(node.get("latency_ms")) == NODE_TIMEOUT_LATENCY_MS
-                    and str(node.get("id") or "") not in fav_ids
-                    and str(node.get("id") or "") not in keep_ids
-                )
-            ]
+            tested_nodes = cleanup_probe_results(tested_nodes, ui_cfg, set(scope_ids) - keep_ids)
             write_json(NODES_FILE, sort_all_nodes(tested_nodes))
 
         if routing_mode == "fixed_ip":
@@ -2863,8 +2921,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
         merged = merge_nodes_preserve_old(old_nodes, new_nodes)
 
         with lock:
-            if len(merged) > 1000:
-                merged = merged[:1000]
+            merged = cap_nodes_preserving_high_risk(merged)
             for n in merged:
                 node_id = str(n.get("id") or "")
                 if node_id and node_id not in old_by_id:
@@ -2981,8 +3038,8 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
             raise ValueError(f"Node not found: {node_id}")
         old_node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None) if active_openvpn_node_id else None
         enforce = RISK_MODE == "enforce" and not manual_request
-        if enforce and not risk_engine.assess(node.get("egress_ip"), refresh=True)["auto_eligible"]:
-            raise exit_risk.RiskBlockedError("候选出口未通过风险核验，取消自动切换")
+        if enforce and not auto_risk_allowed(node):
+            raise exit_risk.RiskBlockedError("候选出口已确认高风险，取消自动切换")
         if apply_manual_blacklist_to_node(node):
             write_json(NODES_FILE, nodes)
             raise RuntimeError(f"Node egress IP is manually blacklisted: {node.get('blacklisted_ip') or node.get('egress_ip') or node.get('proxy_ip')}")
@@ -3025,7 +3082,7 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
             log_node_activity("SWITCH_FAILED", f"OpenVPN failed while connecting {node_id}: {message}", node)
             for item in nodes:
                 item["active"] = False
-            write_json(NODES_FILE, nodes)
+            write_json(NODES_FILE, cleanup_probe_results(nodes, ui_cfg, {node_id}))
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
             set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
@@ -3041,17 +3098,13 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
         setup_policy_routing("tun0")
         if enforce:
             try:
-                node["egress_ip"] = verify_connected_exit(4)
-                families = [socket.AF_INET]
-                verified = [node["egress_ip"]]
-                if proxy_server.tun0_supports_ipv6():
-                    verified.append(verify_connected_exit(6))
-                    families.append(socket.AF_INET6)
-                if any(not risk_engine.assess(ip)["auto_eligible"] for ip in verified):
-                    raise exit_risk.RiskBlockedError("正式放行前出口证据已过期")
-                if process.poll() is not None:
-                    raise exit_risk.RiskBlockedError("核验期间隧道已退出")
-                proxy_server.admit_tunnel(families)
+                families, verified = verify_automatic_tunnel(node)
+                with risk_engine.lock:
+                    if any(risk_engine.assess(ip)["level"] == "high" for ip in verified):
+                        raise exit_risk.RiskBlockedError("放行前确认出口为高风险")
+                    if process.poll() is not None:
+                        raise exit_risk.RiskBlockedError("核验期间隧道已退出")
+                    proxy_server.admit_tunnel(families)
             except Exception as exc:
                 stop_active_openvpn()
                 raise exit_risk.RiskBlockedError("连接后出口核验失败，已停止候选隧道：" + str(exc)) from exc
@@ -3118,6 +3171,7 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
             )
             if not enforce:
                 node["egress_ip"] = proxy_ip or res.get("ip", "")
+                remember_risk_exit(node, node["egress_ip"])
         else:
             proxy_error = res.get("error", "proxy health check failed")
             with lock:
@@ -3246,8 +3300,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
-            if len(merged) > 1000:
-                merged = merged[:1000]
+            merged = cap_nodes_preserving_high_risk(merged)
                 
             for n in merged:
                 config_path = Path(n["config_file"])
@@ -5560,8 +5613,8 @@ function startConnectionPolling() {
 
 async function connectNode(id){
   const selected = nodes.find(n => n.id === id);
-  if (state.exit_risk_mode === "enforce" && !selected?.exit_risk?.auto_eligible &&
-      !confirm("该出口未通过自动切换的风险核验。仍然手动连接？")) return;
+  if (selected?.exit_risk?.level === "high" &&
+      !confirm("该出口已标记为高风险。仍然手动连接？")) return;
   state.is_connecting = true;
   state.active_openvpn_node_id = id;
   state.active_node_latency = "正在连接";
@@ -7060,7 +7113,7 @@ class Handler(BaseHTTPRequestHandler):
                 stripped = n.copy()
                 for old_field in [k for k in stripped if k.startswith("purity_")]:
                     stripped.pop(old_field)
-                stripped["exit_risk"] = (risk_engine.assess(n.get("egress_ip")) if RISK_MODE != "off"
+                stripped["exit_risk"] = (node_risk(n) if RISK_MODE != "off"
                                          else {"level": "off", "score": None})
                 if "config_text" in stripped:
                     del stripped["config_text"]
@@ -7673,6 +7726,15 @@ def main() -> None:
     ensure_dirs()
     install_crash_log_hooks()
     log_node_activity("START", "AimiliVPN service starting")
+    # Remove stale failed rows from the old cache before the collector probes it.
+    # Preserve the previous active exit as a recovery candidate.
+    previous_active = read_json(STATE_FILE, {}).get("active_openvpn_node_id")
+    with lock:
+        nodes = read_nodes()
+        cleaned = cleanup_probe_results(nodes, load_ui_config(),
+                                        {n.get("id") for n in nodes if n.get("id") != previous_active})
+        if len(cleaned) != len(nodes):
+            write_json(NODES_FILE, sort_all_nodes(cleaned))
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"

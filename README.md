@@ -59,14 +59,14 @@ ml restart   # 重启服务
 1. 打开部署完成后输出的 Web 管理后台地址。
 2. 首次进入后，系统会自动拉取 VPNGate 候选节点并执行一次真实出口延迟测速排序。
 3. 测速未完成前，新节点状态会显示“测试中...”动态效果。
-4. 测速结束后，仅保留延迟小于等于当前“延迟筛选阈值”的普通可用节点；默认阈值为 `500ms`，已收藏节点不会因为后续测速失败被自动清理。
+4. 测速结束后，普通不可用节点和超出延迟阈值的普通节点会被清理，包含延迟显示 `-` 的不可达、拒绝连接和认证失败。默认阈值为 `500ms`。当前连接、固定节点、收藏、拉黑条目与已确认高风险的节点保留供回看。
 5. 默认路由模式为“自动配置”，首次测速排序完成后会立即连接当前批次延迟最低的可用节点。
 
 ## 本修改版新增/调整功能
 
 - 真实出口延迟测速: 通过当前 OpenVPN + 本地代理出口检测节点实际延迟，不再只看 VPNGate 原始 ping。
 - 首次自动连接: 首次部署或已有缓存但没有活动连接时，会按当前路由模式测速排序，并自动连接符合规则的最低延迟节点。
-- 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取；新旧节点合并后统一测速排序，剔除不可用节点，并按自动配置连接最低延迟节点。
+- 登录触发刷新: 新安装或执行 `ml update` 后，首次进入 Web UI 会触发一次 VPNGate 节点拉取。新旧节点合并后测速排序、清理普通不可用节点，再按连接规则选择节点。
 - 更新节点逻辑: 点击“更新节点”会拉取新节点，并与旧节点合并后一起测速排序。
 - 终端一键更新: `ml update`只更新原安装渠道，重跑本渠道安装脚本并重启服务。
 - 节点活动日志: 新增 `ml node-log` 命令，持续跟踪当前活动节点 IP、节点切换时间、连接失败、巡检超阈值但未切换、后台线程崩溃等信息。
@@ -87,10 +87,10 @@ ml restart   # 重启服务
 - 收藏菜单: 收藏节点后，即使后续延迟变高或不可用，也不会自动移出收藏，只能用户手动取消收藏。
 - 拉黑菜单: 支持持久拉黑 IP、搜索、添加、取消拉黑；被拉黑 IP 即使重新测速通过也保持不可用。
 - 拉黑保护: 如果意外连接到拉黑 IP，会立即断开并切换到当前列表中最低延迟的非拉黑可用节点。
-- 风险值列显示 VPNGate 实际出口的等级、策略分、情报来源和最近核验时间。首次加载采用观察模式。服务环境变量 `AIMILI_RISK_MODE` 支持 `observe`（只评分）、`enforce`（拦截自动切换）和 `off`（关闭）。服务启动时读取该设置。
+- 风险值列显示 VPNGate 实际出口的等级、策略分、情报来源和最近核验时间。默认 `AIMILI_RISK_MODE=enforce`。已确认高风险的节点保留在列表里，并排除自动切换、自动重连。未验证与待复核的节点按原连通性规则参加选择。可显式设置 `observe` 作只评分观察，或 `off` 关闭评分功能。
 - 系统从现有 `PROXYCHECK_API_KEY`、`ABUSEIPDB_API_KEY` 或 `API_Port.txt` 读取密钥，也支持可选的 `IPQS_API_KEY`。每次只查实际出口，后台优先核验活动节点和少量备用。手动测试单个节点也会刷新其出口评分。每个来源每天最多查询 900 次，复用 15 分钟内的有效数据。
 - 至少两个有效来源且未达滥用条件时为低风险（10）。滥用信号待复核时为 50 或 70，至少两家来源的滥用证据相互印证且含强信号时为高风险（90 或 100）。证据不足显示未验证。VPN 或机房身份只作参考。
-- 拦截模式只允许已核验的低风险出口自动切入，含启动恢复、收藏回退与固定节点重连。管理员可在界面确认后手动连接。正式隧道会再次验证公网出口后放行连接。如果旧连接已停而新出口核验失败，用户会经历中断。切换模式或首次加载代码需要安排维护窗口。
+- 拦截模式在停旧隧道前检查候选，并在正式隧道放行前复核实际出口。已确认高风险的记录在接口失败或结果过期时继续生效，直到至少两家有效来源复核为低风险。管理员可在界面确认后手动连接。如果旧连接已停而新出口核验失败，用户会经历中断。
 - UI 增强: 增加延迟、风险值、物理位置、ASN、运营主体/ISP、网络质量、IP 类型等列。
 - 去广告: 已移除右侧 VPS 购买推荐广告。
 
@@ -244,7 +244,7 @@ ml restart
 - Added fixed region and fixed favorites failover logic.
 - Added persistent IP blacklist management.
 - Added favorite/blacklist UI rules.
-- The risk column shows the observed VPN exit's reputation and supporting sources. Set the service environment variable `AIMILI_RISK_MODE` to `observe` (default), `enforce`, or `off` before startup. Enforced automatic connections require corroborated, current evidence and a second exit check on the connected tunnel. VPN and hosting classifications alone do not block an exit.
+- The risk column shows the observed VPN exit's reputation and supporting sources. The default `AIMILI_RISK_MODE=enforce` keeps confirmed high-risk nodes visible and excludes them from automatic connections. Unverified nodes keep their normal connectivity eligibility. Set `observe` to collect scores without applying the risk policy, or `off` to disable scoring.
 - Added UI columns for latency, risk, location, ASN, ISP, network quality, and IP type.
 - Removed the VPS recommendation ad.
 

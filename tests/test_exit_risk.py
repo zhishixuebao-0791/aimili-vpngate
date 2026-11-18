@@ -49,19 +49,21 @@ class Reputation(unittest.TestCase):
         with self.assertRaises(ValueError):
             risk.normalize("proxycheck", {"status":"ok", IP:{"risk":50,"detections":self.flags}}, IP, NOW)
         self.flags.pop("compromised")
-        self.assertFalse(self.engine.assess(IP, refresh=True)["auto_eligible"])
+        self.assertTrue(self.engine.assess(IP, refresh=True)["auto_eligible"])
 
     def test_corroborated_recent_abuse_is_high_despite_low_latency_or_short_pool(self):
         self.flags["compromised"] = True
         self.abuse.update(abuseConfidenceScore=86,totalReports=5,numDistinctUsers=3,lastReportedAt=DATE)
         result = self.engine.assess(IP, refresh=True)
         self.assertEqual((result["score"], result["level"], result["auto_eligible"]), (100,"high",False))
-        self.assertFalse(self.engine.assess(OTHER)["auto_eligible"])
+        self.assertTrue(self.engine.assess(OTHER)["auto_eligible"])
         self.assertEqual(self.http.call_count, 2)
 
-    def test_single_strong_signal_is_not_eligible(self):
+    def test_single_strong_signal_stays_eligible_for_review(self):
         self.flags["compromised"] = True
-        self.assertEqual(self.engine.assess(IP, refresh=True)["level"], "review")
+        verdict = self.engine.assess(IP, refresh=True)
+        self.assertEqual(verdict["level"], "review")
+        self.assertTrue(verdict["auto_eligible"])
 
     def test_unexplained_high_score_requires_review(self):
         self.flags["proxy"] = False
@@ -69,7 +71,9 @@ class Reputation(unittest.TestCase):
 
     def test_target_mismatch_missing_sources_and_invalid_egress(self):
         self.abuse["ipAddress"] = OTHER
-        self.assertFalse(self.engine.assess(IP, refresh=True)["auto_eligible"])
+        verdict = self.engine.assess(IP, refresh=True)
+        self.assertEqual(verdict["level"], "unknown")
+        self.assertTrue(verdict["auto_eligible"])
         for target in ["", "127.0.0.1", "224.0.0.1", "not-an-address"]:
             self.assertIsNone(self.engine.assess(target, refresh=True)["score"])
         self.assertEqual(self.http.call_count, 2)
@@ -80,7 +84,9 @@ class Reputation(unittest.TestCase):
                                 transport=self.http, daily_limit=1)
         self.assertTrue(fresh.assess(IP, refresh=True)["auto_eligible"])
         self.now += risk.TTL_SECONDS
-        self.assertFalse(fresh.assess(IP, refresh=True)["auto_eligible"])
+        verdict = fresh.assess(IP, refresh=True)
+        self.assertEqual(verdict["level"], "unknown")
+        self.assertTrue(verdict["auto_eligible"])
         self.assertEqual(self.http.call_count, 2)
 
     def test_short_429_applies_across_different_ips(self):
@@ -88,7 +94,23 @@ class Reputation(unittest.TestCase):
         self.engine.assess(IP, refresh=True)
         self.engine.assess(OTHER, refresh=True)
         self.assertEqual(self.http.call_count, 2)
-        self.assertFalse(self.engine.assess(OTHER)["auto_eligible"])
+        self.assertTrue(self.engine.assess(OTHER)["auto_eligible"])
+
+    def test_high_survives_expiry_and_restart_until_fresh_low(self):
+        self.flags["compromised"] = True
+        self.abuse.update(abuseConfidenceScore=86,totalReports=5,numDistinctUsers=3,lastReportedAt=DATE)
+        self.assertEqual(self.engine.assess(IP, refresh=True)["level"], "high")
+        self.now += risk.TTL_SECONDS + 1
+        restored = risk.RiskEngine(self.path, self.engine.keys, clock=lambda: self.now, transport=self.http)
+        self.assertEqual(restored.assess(IP)["level"], "high")
+        self.http.side_effect = TimeoutError
+        self.assertFalse(restored.assess(IP, refresh=True)["auto_eligible"])
+        self.now += 61
+        self.flags["compromised"] = False
+        self.abuse.update(abuseConfidenceScore=0,totalReports=0,numDistinctUsers=0,lastReportedAt=None)
+        self.http.side_effect = self.respond
+        self.assertEqual(restored.assess(IP, refresh=True)["level"], "low")
+        self.assertTrue(restored.assess(IP)["auto_eligible"])
 
     def test_ipqs_suspicion_is_independent_of_vpn_status(self):
         for score, recent, strong in [(75, False, False), (90, True, True)]:
@@ -105,12 +127,36 @@ def manager_subset(names, context):
     return context
 
 
+class Retention(unittest.TestCase):
+    def test_non_timeout_failure_is_removed_except_protected_nodes(self):
+        functions = {"prune_failed_nodes", "node_should_be_removed_after_unfavorite", "cleanup_probe_results",
+                     "cap_nodes_preserving_high_risk", "node_risk", "protect_node_from_cleanup",
+                     "apply_probe_result", "remember_risk_exit"}
+        ctx = manager_subset(functions, {
+            "exit_risk":risk, "risk_engine":Mock(assess=lambda ip: {"level": "high" if ip == IP else "unknown"}),
+            "parse_int":lambda n: int(n or 0), "active_openvpn_node_id":"active",
+            "get_latency_threshold_ms":lambda *args:500, "NODE_TIMEOUT_LATENCY_MS":-1,
+            "load_manual_blacklist":lambda:{}, "manual_blacklist_match_for_node":lambda *args: False,
+            "sort_all_nodes":lambda n:n, "favorite_node_ids":lambda cfg:cfg["favorite_node_ids"],
+        })
+        make = lambda node_id, **extra: dict(id=node_id, probe_status="unavailable", latency_ms=0, **extra)
+        high = make("high", egress_ip=IP)
+        ctx["apply_probe_result"](high, {"egress_ip":""})
+        rows = [make("failed"), high, make("active"), make("favorite"), make("manual", manual_blacklisted=True),
+                {"id":"unknown", "probe_status":"available", "latency_ms":12, "egress_ip":OTHER}]
+        expected = {"high","active","favorite","manual","unknown"}
+        for cleaned in [ctx["cleanup_probe_results"](rows, {"favorite_node_ids":["favorite"]}),
+                        ctx["prune_failed_nodes"](rows, {"favorite"})]:
+            self.assertEqual({n["id"] for n in cleaned}, expected)
+        self.assertIn(high, ctx["cap_nodes_preserving_high_risk"](rows, 1))
+
+
 class Routing(unittest.TestCase):
     def setUp(self):
         import threading
         self.node = {"id":"candidate", "egress_ip":IP, "probe_status":"available", "latency_ms":1}
-        self.verdict = Mock(return_value={"auto_eligible":False})
-        self.ctx = manager_subset({"connect_node","connect_first_available_candidate","auto_risk_allowed","filter_routing_candidates"}, {
+        self.verdict = Mock(return_value={"level":"high", "auto_eligible":False})
+        self.ctx = manager_subset({"connect_node","connect_first_available_candidate","auto_risk_allowed","filter_routing_candidates","node_risk"}, {
             "RISK_MODE":"enforce", "exit_risk":risk, "risk_engine":Mock(assess=self.verdict), "lock":threading.RLock(),
             "active_openvpn_node_id":"old", "is_connecting":False, "active_openvpn_process":Mock(),
             "read_nodes":lambda:[self.node], "set_state":Mock(), "clear_active_connection_state":Mock(),
@@ -140,16 +186,37 @@ class Routing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td)
             self.node["config_file"] = str(path/"candidate.ovpn")
-            self.verdict.return_value = {"auto_eligible":True}
+            self.verdict.return_value = {"level":"unknown", "auto_eligible":True}
             admitted = Mock()
             self.ctx.update(DATA_DIR=path,CONFIG_DIR=path,Path=Path,json=__import__("json"),
                 apply_manual_blacklist_to_node=lambda n:False,run_openvpn_until_ready=lambda *a,**kw:(True,"",Mock()),
                 setup_policy_routing=Mock(), proxy_server=Mock(admit_tunnel=admitted),
-                verify_connected_exit=Mock(side_effect=risk.RiskBlockedError("new exit failed")))
+                verify_automatic_tunnel=Mock(side_effect=risk.RiskBlockedError("new exit failed")))
             with self.assertRaises(risk.RiskBlockedError):
                 self.ctx["connect_node"]("candidate")
             admitted.assert_not_called()
             self.assertEqual(self.ctx["stop_active_openvpn"].call_count, 2)
+
+    def test_unknown_is_available_for_automatic_selection(self):
+        self.verdict.return_value = {"level":"unknown", "auto_eligible":True}
+        self.assertEqual(self.ctx["filter_routing_candidates"]([self.node],{}),[self.node])
+
+    def test_tunnel_rechecks_actual_exit_and_records_rejected_new_address(self):
+        measured = dict(self.node)
+        backup = dict(self.node)
+        write = Mock()
+        ctx = manager_subset({"verify_automatic_tunnel","remember_risk_exit"}, {
+            **self.ctx, "socket":socket, "proxy_server":Mock(tun0_supports_ipv6=lambda:False),
+            "verify_connected_exit":lambda version:OTHER, "read_nodes":lambda:[backup],
+            "write_json":write, "NODES_FILE":"test-fixture",
+        })
+        with self.assertRaises(risk.RiskBlockedError):
+            ctx["verify_automatic_tunnel"](measured)
+        self.assertEqual(backup["risk_exit_ipv4"], OTHER)
+        self.verdict.assert_called_with(OTHER, refresh=True)
+        write.assert_called_once()
+        self.verdict.return_value = {"level":"unknown"}
+        self.assertEqual(ctx["verify_automatic_tunnel"](measured), ([socket.AF_INET], [OTHER]))
 
     def test_observe_mode_does_not_gate_selection(self):
         self.ctx["RISK_MODE"]="observe"

@@ -137,7 +137,7 @@ def decision(ip, records, now):
     supporting = [name for name, r in valid.items() if r["data"].get("abuse") is True]
     strong = [name for name in supporting if valid[name]["data"].get("strong") is True]
     uncertain = [name for name, r in valid.items() if r["data"].get("unconfirmed") is True]
-    score, level, eligible = None, "unknown", False
+    score, level = None, "unknown"
     if len(supporting) >= 2 and strong:
         score, level = (100 if len(strong) >= 2 else 90), "high"
         reasons.insert(0, "多个独立来源证实近期滥用：" + ", ".join(supporting))
@@ -152,12 +152,12 @@ def decision(ip, records, now):
         level = "review"
         reasons.insert(0, "此前有风险信号，该来源需要重新核验")
     elif len(valid) >= 2:
-        score, level, eligible = 10, "low", True
+        score, level = 10, "low"
         reasons.insert(0, "至少两个有效来源未达到滥用判定条件；不代表绝对安全")
     else:
         reasons.insert(0, "真实出口未验证或有效独立来源不足两个")
     return {"policy": POLICY, "egress_ip": ip, "level": level, "score": score,
-            "auto_eligible": eligible, "reasons": reasons, "sources": list(valid),
+            "auto_eligible": level != "high", "reasons": reasons, "sources": list(valid),
             "checked_at": min((r["checked_at"] for r in valid.values()), default=0),
             "expires_at": min((r["expires_at"] for r in valid.values()), default=0),
             "providers": copy.deepcopy({n: r for n, r in records.items() if n in PROVIDERS})}
@@ -201,6 +201,14 @@ class RiskEngine:
         except (OSError, ValueError, TypeError):
             self.state = {"schema": 1, "entries": {}, "budgets": {}}
             self.cache_error = True  # Never reset a corrupt daily quota and query again.
+        if not self.state.get("confirmed_high_initialized"):
+            for records in self.state["entries"].values():
+                if not isinstance(records, dict):
+                    continue
+                times = sorted({r["checked_at"] for r in records.values() if valid_evidence(r)})
+                for checked_at in times:
+                    self._record_high_decision("", records, checked_at)
+            self.state["confirmed_high_initialized"] = True
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,6 +354,7 @@ class RiskEngine:
                         budget["cooldown_until"] = max(budget["cooldown_until"], self.clock() + wait)
             with self.lock:
                 records[provider] = outcome
+                self._record_high_decision(ip, records, self.clock())
                 try:
                     self._save()
                 except (OSError, ValueError):
@@ -357,10 +366,22 @@ class RiskEngine:
 
     def _result(self, ip, records):
         result = decision(ip, records, self.clock())
+        confirmed = records.get("confirmed_high")
+        if (result["level"] != "high" and isinstance(confirmed, dict)
+                and confirmed.get("score") in (90, 100)):
+            result.update(level="high", score=confirmed["score"], auto_eligible=False,
+                          checked_at=confirmed.get("checked_at", 0), sources=confirmed.get("sources", []))
+            result["reasons"].insert(0, "此前已确认高风险，等待两家有效来源复核为低风险")
         if self.cache_error:
-            result.update(auto_eligible=False, level="unknown", score=None)
-            result["reasons"].append("风险缓存异常，暂停自动入选")
+            result["reasons"].append("风险缓存异常")
         return result
+
+    def _record_high_decision(self, ip, records, now):
+        result = decision(ip, records, now)
+        if result["level"] == "high":
+            records["confirmed_high"] = {field: result[field] for field in ("score", "checked_at", "sources")}
+        elif result["level"] == "low":
+            records.pop("confirmed_high", None)
 
     def status(self):
         with self.lock:
