@@ -232,7 +232,7 @@ class ManagerBatchTests(unittest.TestCase):
             'mark_purity_disabled': lambda node: None, 'load_manual_blacklist': lambda: {},
             'apply_manual_blacklist_to_node': lambda *args: None, 'sort_all_nodes': lambda value: value,
             'write_json': Mock(), 'NODES_FILE': 'fixture', 'cleanup_favorite_node_ids': Mock()}
-        namespace.update(RISK_MODE='observe', favorite_node_ids=lambda cfg: [], load_ui_config=lambda: {},
+        namespace.update(risk_mode=lambda: 'observe', favorite_node_ids=lambda cfg: [], load_ui_config=lambda: {},
                          apply_probe_result=lambda node, result: node.update(result),
                          cleanup_probe_results=lambda nodes, cfg, ids: nodes,
                          NODE_TIMEOUT_LATENCY_MS=999999, parse_int=lambda value: int(value or 0))

@@ -26,11 +26,17 @@ def _split_env_keys(value: str) -> list[str]:
     return [item.strip() for item in re.split(r"[\s,;]+", value or "") if item.strip()]
 
 
-def _load_api_port_keys() -> tuple[list[str], list[str]]:
+def _load_api_port_keys() -> tuple[list[str], list[str], list[str]]:
     try:
-        text = API_KEYS_FILE.read_text(encoding="utf-8", errors="ignore")
+        text = API_KEYS_FILE.read_text(encoding="utf-8-sig", errors="ignore")
     except Exception:
-        return [], []
+        return [], [], []
+
+    ipqs_section = ""
+    ipqs_header = re.search(r"(?im)^[ \t]*(?:IPQualityScore|IPQS)(?=[^a-z0-9_]|\Z)[^\r\n]*", text)
+    if ipqs_header:
+        ipqs_section = text[ipqs_header.end():]
+        text = text[:ipqs_header.start()]
 
     proxy_section, abuse_section = text, ""
     marker = "AbuseIPDB"
@@ -39,19 +45,26 @@ def _load_api_port_keys() -> tuple[list[str], list[str]]:
 
     proxy_keys = re.findall(r"\b[a-z0-9]{5,8}(?:-[a-z0-9]{5,8}){3}\b", proxy_section, flags=re.I)
     abuse_keys = re.findall(r"\b[a-f0-9]{64,128}\b", abuse_section, flags=re.I)
-    return list(dict.fromkeys(proxy_keys)), list(dict.fromkeys(abuse_keys))
+    ipqs_keys = re.findall(r"(?im)^[ \t]*(?:api[ \t_-]*keys?[ \t]*[:：=][ \t]*)?([a-z0-9_-]{16,128})[ \t]*$", ipqs_section)
+    return list(dict.fromkeys(proxy_keys)), list(dict.fromkeys(abuse_keys)), list(dict.fromkeys(ipqs_keys))
 
 
 def get_proxycheck_keys() -> list[str]:
     keys = _split_env_keys(PROXYCHECK_API_KEY)
-    file_proxy_keys, _ = _load_api_port_keys()
+    file_proxy_keys, _, _ = _load_api_port_keys()
     return list(dict.fromkeys(keys + file_proxy_keys))
 
 
 def get_abuseipdb_keys() -> list[str]:
     keys = _split_env_keys(ABUSEIPDB_API_KEY)
-    _, file_abuse_keys = _load_api_port_keys()
+    _, file_abuse_keys, _ = _load_api_port_keys()
     return list(dict.fromkeys(keys + file_abuse_keys))
+
+
+def get_ipqs_keys() -> list[str]:
+    keys = _split_env_keys(os.environ.get("IPQS_API_KEY", ""))
+    _, _, file_keys = _load_api_port_keys()
+    return list(dict.fromkeys(keys + file_keys))
 
 
 PROXYCHECK_API_KEY = os.environ.get("PROXYCHECK_API_KEY", "").strip()

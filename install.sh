@@ -605,6 +605,10 @@ def uninstall_service():
             if result.returncode:
                 print("网络调优回退未完成，为保留回退工具，本次停止卸载。请核对提示后重试。")
                 return
+        monitor_tool = os.path.join(INSTALL_DIR, "ops", "install_monitor.sh")
+        if os.path.isfile(monitor_tool) and subprocess.run(["sh", monitor_tool, "uninstall"]).returncode:
+            print("监控服务未能卸载，已保留程序文件。请核对上方提示。")
+            return
         stop_service()
         if shutil.which("systemctl"):
             subprocess.run(["systemctl", "disable", "aimilivpn.service"])
@@ -1147,6 +1151,13 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl restart aimilivpn.service || true
 elif command -v rc-service >/dev/null 2>&1; then
     rc-service aimilivpn restart || true
+fi
+
+MONITOR_TOOL="${INSTALL_DIR}/ops/install_monitor.sh"
+if [ "${AIMILI_MONITOR:-1}" != "0" ] && [ -f "$MONITOR_TOOL" ]; then
+    if ! sh "$MONITOR_TOOL" install; then
+        echo -e "${YELLOW}警告: 独立出网监控未启动，请检查服务日志。${PLAIN}"
+    fi
 fi
 
 # Wait and poll for node loading and active connection

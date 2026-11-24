@@ -48,7 +48,7 @@ class OpenVPNTests(unittest.TestCase):
         def stop(*args,**kwargs):calls.append(True);stopped.set()
         ns={'queue':queue,'threading':threading,'time':time,'ROOT_DIR':ROOT,'OPENVPN_TEST_TIMEOUT_SECONDS':4,
             'subprocess':types.SimpleNamespace(Popen=lambda *a,**kw:process,PIPE=subprocess.PIPE,STDOUT=subprocess.STDOUT),
-            'openvpn_command':lambda *a:['openvpn','--connect-retry-max','1'],
+            'openvpn_command':lambda *a, **kw:['openvpn','--connect-retry-max','1'],
             'update_handshake_status':lambda *a:None,'log_to_json':lambda *a:None,'stop_process':stop,
             'vpn_utils':self.utils,'is_probe_timeout_message':lambda s:any(v in s.lower() for v in ['timeout','timed out'])}
         f=functions('vpngate_manager.py',['run_openvpn_until_ready'],ns)['run_openvpn_until_ready']

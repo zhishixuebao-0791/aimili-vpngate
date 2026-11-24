@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 from pathlib import Path
 from typing import Any
 import concurrent.futures
@@ -108,7 +109,7 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号（稳定版）
-APP_VERSION = "1.26.23"
+APP_VERSION = "1.26.25"
 APP_CHANNEL = "stable"
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
@@ -135,6 +136,7 @@ LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
+UI_HTTPS_PROXIES = frozenset(os.environ.get("AIMILI_UI_HTTPS_PROXIES", "").replace(",", " ").split())
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 NODE_LATENCY_LIMIT_MS = DEFAULT_LATENCY_THRESHOLD_MS
 RISK_MODE = os.environ.get("AIMILI_RISK_MODE", "enforce").strip().lower()
@@ -145,14 +147,46 @@ ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__"
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 
 
-def risk_key(provider):
+def legacy_risk_keys(provider):
     if provider == "ipqs":
-        return os.environ.get("IPQS_API_KEY", "").strip()
-    keys = vpn_utils.get_abuseipdb_keys() if provider == "abuseipdb" else vpn_utils.get_proxycheck_keys()
-    return keys[0] if keys else ""
+        return vpn_utils.get_ipqs_keys()
+    return vpn_utils.get_abuseipdb_keys() if provider == "abuseipdb" else vpn_utils.get_proxycheck_keys()
 
 
-risk_engine = exit_risk.RiskEngine(DATA_DIR / "exit_risk_v1.json", risk_key)
+risk_cache = DATA_DIR / "exit_risk_v1.json"
+risk_settings = exit_risk.RiskSettings(
+    DATA_DIR / "risk_settings.json", legacy_risk_keys,
+    legacy_enabled=RISK_MODE != "off" and ("AIMILI_RISK_MODE" in os.environ or risk_cache.is_file()),
+)
+def log_risk_health(event, provider, outcome):
+    status, retry_at = outcome
+    message = f"event={event} provider={provider} status={status} retry_at={int(retry_at)}"
+    print(f"[RiskHealth] {message}", flush=True)
+    log_to_json("INFO" if status == "valid" else "WARNING", "Risk", message)
+
+
+def record_risk_query_failure(provider, key, outcome, shared_cooldown):
+    risk_settings.record_query_failure(provider, key, outcome, shared_cooldown)
+    log_risk_health("query_failure", provider, outcome)
+
+
+risk_engine = exit_risk.RiskEngine(risk_cache, risk_settings.keys_for, key_failure=record_risk_query_failure)
+risk_refresh_requested = threading.Event()
+
+
+def risk_mode():
+    return RISK_MODE if risk_settings.active else "off"
+
+
+def risk_gate_enabled():
+    return RISK_MODE == "enforce" and risk_settings.protect_cached
+
+
+def risk_settings_summary():
+    settings = risk_settings.summary()
+    if RISK_MODE == "off":
+        settings.update(enabled=False, status="off", pending_checks=0, locked=True)
+    return settings
 
 
 def node_risk(node):
@@ -183,12 +217,12 @@ def apply_probe_result(node, tested):
 
 
 def auto_risk_allowed(node):
-    return RISK_MODE != "enforce" or node_risk(node)["level"] != "high"
+    return not risk_gate_enabled() or node_risk(node)["level"] != "high"
 
 
 def refresh_risk_pool(nodes, ui_cfg):
     # Quota goes first to the active exit, fixed target, favourites and fastest backups.
-    if RISK_MODE == "off":
+    if risk_mode() == "off":
         return
     favorites = set(ui_cfg.get("favorite_node_ids", [])) if ui_cfg.get("routing_mode") in ("favorites", "fixed_favorites") else set()
     pool = sorted((n for n in nodes if n.get("probe_status") == "available" or n.get("active")),
@@ -214,13 +248,22 @@ def refresh_risk_pool(nodes, ui_cfg):
                 break
 
 
+def validate_risk_key(provider, key):
+    outcome = risk_engine.validate_key(provider, key)
+    log_risk_health("validation", provider, outcome)
+    return outcome
+
+
 def refresh_exit_risk_loop():
-    while True:
+    while RISK_MODE != "off":
+        risk_refresh_requested.clear()
         try:
-            refresh_risk_pool(read_nodes(), load_ui_config())
+            risk_settings.validate_pending(validate_risk_key)
+            if risk_mode() != "off":
+                refresh_risk_pool(read_nodes(), load_ui_config())
         except Exception as exc:
             log_to_json("WARNING", "Risk", "出口信誉刷新失败 " + type(exc).__name__)
-        time.sleep(60)
+        risk_refresh_requested.wait(60)
 
 
 def verify_connected_exit(version):
@@ -306,11 +349,6 @@ def ensure_dirs() -> None:
             AUTH_FILE.chmod(0o600)
         except OSError:
             pass
-
-def mark_login_refresh_required(reason: str = "manual marker") -> None:
-    ensure_dirs()
-    payload = {"reason": reason, "created_at": time.time()}
-    write_json(LOGIN_REFRESH_REQUIRED_FILE, payload)
 
 def consume_login_refresh_required() -> dict[str, Any] | None:
     if not LOGIN_REFRESH_REQUIRED_FILE.exists():
@@ -506,16 +544,6 @@ def normalize_ip_value(value: Any) -> str:
 
 def node_ip_value(node: dict[str, Any]) -> str:
     return normalize_ip_value(node.get("ip")) or normalize_ip_value(node.get("remote_host"))
-
-def node_ip_values(node: dict[str, Any] | None) -> set[str]:
-    if not isinstance(node, dict):
-        return set()
-    values: set[str] = set()
-    for key in ("ip", "remote_host", "egress_ip", "proxy_ip", "blacklisted_ip"):
-        ip = normalize_ip_value(node.get(key))
-        if ip:
-            values.add(ip)
-    return values
 
 def node_egress_ip_values(node: dict[str, Any] | None) -> set[str]:
     if not isinstance(node, dict):
@@ -745,7 +773,6 @@ def disconnect_active_if_manual_blacklisted(ip: str) -> bool:
         return bool(old_active_id)
     return False
 
-import hashlib
 import random
 
 def generate_random_password() -> str:
@@ -910,10 +937,6 @@ try:
         UI_HOST = _init_cfg["host"]
 except Exception:
     pass
-
-def get_session_token(password: str, username: str = "admin") -> str:
-    salt = "aimilivpn_secure_salt_2026"
-    return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 _last_cleanup_time = 0.0
 
@@ -1552,7 +1575,7 @@ def get_openvpn_version() -> float:
     _openvpn_version = 2.4
     return _openvpn_version
 
-def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
+def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", *, guard_reconnect: bool = False) -> list[str]:
     command = split_openvpn_command()
     command.extend(
         [
@@ -1612,7 +1635,7 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
     except Exception:
         pass
         
-    if dev == "tun0" and RISK_MODE == "enforce":
+    if dev == "tun0" and guard_reconnect:
         command.extend(["--remap-usr1", "SIGTERM"])
     if route_nopull:
         command.append("--route-nopull")
@@ -1702,11 +1725,11 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", keep_process: bool | None = None) -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", keep_process: bool | None = None, *, guard_reconnect: bool = False) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
-            openvpn_command(config_file, route_nopull, dev),
+            openvpn_command(config_file, route_nopull, dev, guard_reconnect=guard_reconnect),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1853,8 +1876,7 @@ def cleanup_policy_routing() -> None:
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
-        if RISK_MODE == "enforce":
-            proxy_server.admit_tunnel(())
+        proxy_server.admit_tunnel(())
         cleanup_policy_routing()
         config_to_delete = None
         if active_openvpn_node_id:
@@ -2000,26 +2022,6 @@ def remove_nodes_by_ids(node_ids: set[str]) -> None:
         kept = [n for n in nodes if not (isinstance(n, dict) and str(n.get("id") or "") in node_ids)]
         if len(kept) != len(nodes):
             write_json(NODES_FILE, sort_all_nodes(kept))
-
-def remove_nodes_by_ips(ips: set[str]) -> list[str]:
-    normalized = {normalize_ip_value(ip) for ip in ips}
-    normalized.discard("")
-    if not normalized:
-        return []
-    removed: list[str] = []
-    with lock:
-        nodes = read_json(NODES_FILE, [])
-        if not isinstance(nodes, list):
-            return []
-        kept = []
-        for node in nodes:
-            if isinstance(node, dict) and node_egress_ip_values(node).intersection(normalized):
-                removed.append(str(node.get("id") or ""))
-                continue
-            kept.append(node)
-        if removed:
-            write_json(NODES_FILE, sort_all_nodes(kept))
-    return removed
 
 def mark_node_connect_failed(node_id: str, message: str) -> None:
     node_id = str(node_id or "")
@@ -2257,7 +2259,7 @@ def build_interface_probe_request(url: str) -> tuple[str, str, str]:
     probe_url = urllib.parse.urlunparse(parsed._replace(netloc=netloc))
     return probe_url, route_ip, host
 
-# 出口延迟测速目标：(URL, 响应体是否直接为 IP)。节点测速与连接后代理测速共用，各请求一次取最快，保证口径一致
+# 用于绑定临时测速隧道的候选节点初筛。(URL, 响应体是否直接为 IP)
 EGRESS_LATENCY_TARGETS = [
     ("http://cp.cloudflare.com/generate_204", False),
     ("http://api.ipify.org", True),
@@ -2526,7 +2528,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node_info = node.copy()
 
     tested = test_node_real_egress(node_info, purity_check=False)
-    if RISK_MODE != "off" and tested.get("probe_status") == "available":
+    if risk_mode() != "off" and tested.get("probe_status") == "available":
         risk_engine.assess(tested.get("egress_ip"), refresh=True)
 
     with lock:
@@ -2580,7 +2582,7 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
 
-    if RISK_MODE == "enforce":
+    if risk_mode() == "enforce":
         refresh_risk_pool([{**n, **updated_nodes_map.get(n.get("id"), {})} for n in to_test], load_ui_config())
 
     with lock:
@@ -2600,8 +2602,6 @@ def test_multiple_nodes(node_ids: list[str], cleanup_favorites: bool = True) -> 
         
     return list(updated_nodes_map.values())
 
-fixed_region_failover_lock = threading.Lock()
-fixed_favorites_failover_lock = threading.Lock()
 
 def country_matches(node: dict[str, Any], target_country: str) -> bool:
     if not target_country:
@@ -2796,52 +2796,6 @@ def cleanup_favorite_node_ids(nodes: list[dict[str, Any]] | None = None) -> list
             auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     return cleaned
 
-def refresh_and_switch_fixed_region(reason: str) -> None:
-    if not fixed_region_failover_lock.acquire(blocking=False):
-        print(f"[固定地区切换] 已有固定地区刷新切换任务运行中，跳过本次触发: {reason}", flush=True)
-        return
-    try:
-        ui_cfg = load_ui_config()
-        if ui_cfg.get("routing_mode") != "fixed_region":
-            return
-        if not ui_cfg.get("connection_enabled", True):
-            return
-        msg = f"固定地区模式触发新旧节点合并测速排序。原因: {reason}"
-        print(f"[固定地区切换] {msg}", flush=True)
-        log_to_json("INFO", "VPN", msg)
-        refresh_test_prune_and_maybe_switch(reason)
-    except Exception as exc:
-        print(f"[固定地区切换] 刷新测速排序并切换失败: {exc}", flush=True)
-        log_to_json("ERROR", "VPN", f"固定地区刷新切换失败: {exc}")
-    finally:
-        fixed_region_failover_lock.release()
-
-def refresh_and_switch_fixed_favorites(reason: str) -> None:
-    if not fixed_favorites_failover_lock.acquire(blocking=False):
-        print(f"[固定收藏切换] 已有固定收藏刷新切换任务运行中，跳过本次触发: {reason}", flush=True)
-        return
-    try:
-        ui_cfg = load_ui_config()
-        if ui_cfg.get("routing_mode") != "fixed_favorites":
-            return
-        if not ui_cfg.get("connection_enabled", True):
-            return
-
-        fav_ids = favorite_node_ids(ui_cfg)
-        if not fav_ids:
-            set_state(last_check_message="固定收藏菜单模式没有收藏节点，无法自动切换")
-            return
-
-        msg = f"固定收藏菜单模式触发新旧节点合并测速排序。原因: {reason}"
-        print(f"[固定收藏切换] {msg}", flush=True)
-        log_to_json("INFO", "VPN", msg)
-        refresh_test_prune_and_maybe_switch(reason)
-    except Exception as exc:
-        print(f"[固定收藏切换] 收藏节点测速排序并切换失败: {exc}", flush=True)
-        log_to_json("ERROR", "VPN", f"固定收藏刷新切换失败: {exc}")
-    finally:
-        fixed_favorites_failover_lock.release()
-
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -2871,10 +2825,9 @@ def auto_switch_node(attempt: int = 0) -> None:
         log_to_json("INFO", "VPN", msg)
         connect_first_available_candidate(candidates, msg)
         return
+    if active_openvpn_running():
+        set_state(last_check_message="当前没有可用的备用出口，保留活动连接并在后台补齐节点")
     else:
-        if RISK_MODE == "enforce" and active_openvpn_running():
-            set_state(last_check_message="当前没有通过规则的备用出口，保留活动连接")
-            return
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         if routing_mode == "fixed_region" and target_country:
             msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
@@ -2887,14 +2840,14 @@ def auto_switch_node(attempt: int = 0) -> None:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
         set_state(active_openvpn_node_id="", last_check_message=msg)
-        
-        def bg_fetch_and_switch():
-            try:
-                refresh_test_prune_and_maybe_switch("auto switch fallback")
-            except Exception as e:
-                print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
-        
-        threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+
+    def bg_fetch_and_switch():
+        try:
+            refresh_test_prune_and_maybe_switch("auto switch fallback")
+        except Exception as e:
+            print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
+
+    threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str | None = None) -> str:
     global active_openvpn_node_id, is_connecting
@@ -2944,6 +2897,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
 
         with lock:
             tested_nodes = read_nodes()
+            keep_running = bool(active_id and active_openvpn_node_id == active_id and active_openvpn_running())
             keep_unavailable_active_without_fallback = False
             if routing_mode in ("favorites", "fixed_favorites") and not ui_cfg.get("fav_fail_fallback", True):
                 favorite_available = any(
@@ -2955,7 +2909,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
                 keep_unavailable_active_without_fallback = not favorite_available and bool(active_id)
             for node in tested_nodes:
                 if node.get("id") == active_id:
-                    if RISK_MODE == "enforce" and active_openvpn_running():
+                    if keep_running:
                         node["active"] = True
                         continue
                     node["latency_ms"] = max(parse_int(node.get("latency_ms")), latency_threshold + 1)
@@ -2970,11 +2924,11 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
                 elif not fixed_ip_mode:
                     node["active"] = False
 
-            if RISK_MODE != "enforce" and not fixed_ip_mode and active_id and not keep_unavailable_active_without_fallback:
+            if active_id and active_openvpn_node_id == active_id and not (keep_running or fixed_ip_mode or keep_unavailable_active_without_fallback):
                 stop_active_openvpn()
                 active_openvpn_node_id = ""
 
-            keep_ids = {active_id} if (RISK_MODE == "enforce" or fixed_ip_mode or keep_unavailable_active_without_fallback) and active_id else set()
+            keep_ids = {active_id} if (keep_running or fixed_ip_mode or keep_unavailable_active_without_fallback) and active_id else set()
             pruned = prune_failed_nodes(tested_nodes, fav_ids, keep_ids=keep_ids)
             write_json(NODES_FILE, pruned)
 
@@ -2995,7 +2949,7 @@ def refresh_test_prune_and_maybe_switch(reason: str, routing_mode_override: str 
             ui_cfg["force_country"] = ""
             ui_cfg["routing_ip_type"] = "all"
         candidates = filter_routing_candidates(pruned, ui_cfg, exclude_active=False)
-        if RISK_MODE == "enforce" and active_id:
+        if keep_running:
             candidates = [n for n in candidates if n.get("id") != active_id]
         if not candidates:
             msg = "节点测速排序完成，但没有符合当前路由模式的可用节点"
@@ -3037,8 +2991,7 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
         if not node:
             raise ValueError(f"Node not found: {node_id}")
         old_node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None) if active_openvpn_node_id else None
-        enforce = RISK_MODE == "enforce" and not manual_request
-        if enforce and not auto_risk_allowed(node):
+        if not manual_request and not auto_risk_allowed(node):
             raise exit_risk.RiskBlockedError("候选出口已确认高风险，取消自动切换")
         if apply_manual_blacklist_to_node(node):
             write_json(NODES_FILE, nodes)
@@ -3070,7 +3023,8 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True,
+                                                       guard_reconnect=True)
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -3096,20 +3050,23 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
+        with risk_settings.lock:
+            enforce = not manual_request and risk_gate_enabled()
+            if not enforce:
+                proxy_server.admit_tunnel(None)
         if enforce:
             try:
                 families, verified = verify_automatic_tunnel(node)
-                with risk_engine.lock:
-                    if any(risk_engine.assess(ip)["level"] == "high" for ip in verified):
+                with risk_engine.lock, risk_settings.lock:
+                    still_enforced = risk_gate_enabled()
+                    if still_enforced and any(risk_engine.assess(ip)["level"] == "high" for ip in verified):
                         raise exit_risk.RiskBlockedError("放行前确认出口为高风险")
                     if process.poll() is not None:
                         raise exit_risk.RiskBlockedError("核验期间隧道已退出")
-                    proxy_server.admit_tunnel(families)
+                    proxy_server.admit_tunnel(families if still_enforced else None)
             except Exception as exc:
                 stop_active_openvpn()
                 raise exit_risk.RiskBlockedError("连接后出口核验失败，已停止候选隧道：" + str(exc)) from exc
-        elif RISK_MODE == "enforce":
-            proxy_server.admit_tunnel(None)
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -3117,15 +3074,8 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
         
         set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
             
-        for item in nodes:
-            item["active"] = item.get("id") == node_id
-            if item["active"]:
-                _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-                item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
-        write_json(NODES_FILE, nodes)
-        
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-        res = check_proxy_health()
+        res = check_proxy_health(require_egress_ip=True)
         if res["ok"]:
             proxy_latency = parse_int(res.get("latency_ms"))
             if proxy_latency > 0:
@@ -3199,7 +3149,22 @@ def connect_node(node_id: str, *, manual_request: bool = False) -> str:
             raise RuntimeError(f"Proxy health check failed: {proxy_error}")
             
         latency_str = f"{last_active_latency} ms" if res.get("ok") and last_active_latency > 0 else "检测超时"
-        write_json(NODES_FILE, nodes)
+        with lock:
+            current_nodes = read_nodes()
+            current = next((item for item in current_nodes if item.get("id") == node_id), None)
+            if current is None:
+                current = node
+                current_nodes.append(current)
+            for item in current_nodes:
+                item["active"] = item is current
+            proxy_host = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
+            current["probe_message"] = f"Active node. HTTP proxy: http://{proxy_host}:{LOCAL_PROXY_PORT}"
+            for field in ("egress_ip", "risk_exit_ipv4", "risk_exit_ipv6"):
+                if field in node:
+                    current[field] = node[field]
+            if old_node and old_node["id"] != node_id:
+                current_nodes = cleanup_probe_results(current_nodes, load_ui_config(), {old_node["id"]})
+            write_json(NODES_FILE, current_nodes)
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         if old_node and old_node.get("id") != node_id:
             log_node_activity("SWITCH", f"Switched from {old_node.get('id')} to {node_id}", node)
@@ -4088,13 +4053,23 @@ INDEX_HTML = r"""<!doctype html>
       padding: 16px;
       margin-bottom: 24px;
       display: flex;
-      gap: 16px;
+      gap: 12px;
       flex-wrap: wrap;
       align-items: center;
     }
 
-    .toolbar select {
-      width: 180px;
+    .toolbar-filters {
+      flex: 1 1 360px;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 180px));
+      gap: 12px;
+    }
+
+    .toolbar-filters select {
+      width: 100%;
+      min-width: 0;
+      color-scheme: dark;
       height: 42px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid var(--border-color);
@@ -4103,37 +4078,96 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-primary);
       font-family: inherit;
       font-size: 14px;
-      outline: none;
-      transition: all 0.2s ease;
+      transition: border-color 0.2s ease, background-color 0.2s ease;
       cursor: pointer;
     }
 
-    .toolbar select:focus {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: #0f172a;
-    }
-
-    .toolbar input {
-      flex: 1;
-      min-width: 250px;
+    .toolbar > .toolbar-btn {
       height: 42px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 16px;
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 14px;
-      transition: all 0.2s ease;
     }
 
-    .toolbar input:focus {
-      outline: none;
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.8);
+    .toolbar > .toolbar-btn svg {
+      width: 16px;
+      height: 16px;
     }
+
+    .toolbar :is(select, button, input):focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+
+    @media (max-width: 960px) {
+      .toolbar-filters {
+        flex-basis: 100%;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .toolbar > .toolbar-btn {
+        flex: 1;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .toolbar, .toolbar-filters {
+        gap: 10px;
+      }
+
+      .toolbar {
+        padding: 12px;
+      }
+
+      .toolbar-filters {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      #ip_type_filter {
+        grid-column: 1 / -1;
+      }
+    }
+
+    .risk-control { min-width: 0; display: grid; gap: 4px; }
+    @media (max-width: 640px) {
+      .risk-control { flex-basis: 100%; }
+    }
+    .risk-control-row, .risk-switch { display: flex; align-items: center; gap: 8px; }
+    .risk-switch { color: var(--text-primary); font-size: 13px; cursor: pointer; }
+    .toolbar .risk-switch input {
+      appearance: none; position: relative; flex: none; width: 34px; height: 20px;
+      margin: 0; padding: 0; border-radius: 999px; background: var(--bg-base, #111827);
+      border: 1px solid var(--border-color); cursor: pointer;
+    }
+    .risk-switch input::before {
+      content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px;
+      border-radius: 50%; background: var(--text-secondary); transition: transform .15s;
+    }
+    .toolbar .risk-switch input:checked { background: #2563eb; border-color: #2563eb; }
+    .risk-switch input:checked::before { transform: translateX(14px); background: #fff; }
+    .risk-switch input:disabled { opacity: .55; cursor: default; }
+    .risk-control small { font-size: 11px; color: var(--text-secondary); }
+    .risk-control small.risk-invalid { color: #fb7185; }
+    .risk-feedback { color: #fb7185; font-size: 12px; margin: 0; }
+    .risk-feedback:empty { display: none; }
+    #risk_configure { height: 28px; padding: 0 8px; font-size: 12px; }
+    #risk_configure:disabled { color: var(--text-secondary); opacity: .45; cursor: not-allowed; }
+    .risk-dialog {
+      background: #161e31; color: var(--text-primary); border: 1px solid var(--border-color);
+      border-radius: 16px; width: min(480px, calc(100% - 32px)); padding: 24px;
+      box-sizing: border-box; max-height: calc(100dvh - 32px); overflow-y: auto;
+    }
+    .risk-dialog::backdrop { background: rgba(9, 13, 22, .72); }
+    .risk-dialog h2 { margin: 0 0 8px; font-size: 19px; }
+    .risk-dialog-description { margin: 0 0 16px; color: var(--text-secondary); font-size: 13px; }
+    .risk-provider {
+      min-width: 0; border: 1px solid var(--border-color); border-radius: 8px;
+      margin: 0 0 10px; padding: 10px; display: grid; gap: 8px;
+    }
+    .risk-provider legend { padding: 0 4px; font-size: 13px; }
+    .risk-key-rows { display: grid; gap: 8px; }
+    .risk-key-row { display: flex; align-items: center; gap: 8px; }
+    .risk-key-row input { flex: 1; min-width: 0; height: 34px; }
+    .risk-provider button { padding: 0 10px; height: 30px; flex: none; font-size: 12px; }
+    .risk-provider .risk-key-add { justify-self: start; }
+    .risk-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
     .table-wrapper {
       background: var(--bg-surface);
@@ -4358,21 +4392,18 @@ INDEX_HTML = r"""<!doctype html>
         flex-direction: column;
         align-items: flex-start;
         padding: 16px 20px;
+        gap: 12px;
       }
       .btn-group {
         width: 100%;
-        margin-top: 12px;
+        flex-wrap: wrap;
+        gap: 8px;
       }
-      .btn-group button, .btn-group .btn-telegram {
-        flex: 1;
+      .btn-group > * {
+        flex: 1 1 120px;
       }
-      .btn-group .dropdown {
-        flex: 1;
-        display: flex;
-      }
-      .btn-group .dropdown button {
+      .btn-group .dropdown > button {
         width: 100%;
-        flex: 1;
       }
       main {
         padding: 16px 20px;
@@ -4622,32 +4653,57 @@ INDEX_HTML = r"""<!doctype html>
 
 
   <section class="toolbar">
-    <select id="status_filter">
-      <option value="all">全部节点</option>
-      <option value="available">可用节点</option>
-      <option value="unavailable">失效节点</option>
-    </select>
-    <select id="country_filter">
-      <option value="">所有国家</option>
-    </select>
-    <select id="ip_type_filter">
-      <option value="">所有IP类型</option>
-      <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
-    </select>
-    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+    <div class="toolbar-filters">
+      <select id="status_filter" aria-label="节点状态">
+        <option value="all">全部节点</option>
+        <option value="available">可用节点</option>
+        <option value="unavailable">失效节点</option>
+      </select>
+      <select id="country_filter" aria-label="国家或地区">
+        <option value="">所有国家</option>
+      </select>
+      <select id="ip_type_filter" aria-label="IP 类型">
+        <option value="">所有IP类型</option>
+        <option value="residential">住宅IP</option>
+        <option value="hosting">机房IP</option>
+      </select>
+    </div>
+    <div class="risk-control">
+      <div class="risk-control-row">
+        <label class="risk-switch">
+          <input id="risk_toggle" type="checkbox" role="switch" aria-describedby="risk_hint risk_feedback" disabled>
+          风险检测
+        </label>
+        <button id="risk_configure" class="toolbar-btn" type="button" disabled>配置API</button>
+      </div>
+      <small id="risk_hint">开启该功能需要提供可调用的API Key</small>
+      <p id="risk_feedback" class="risk-feedback" role="alert"></p>
+    </div>
+    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()">
+      <svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
       </svg>
       收藏菜单
     </button>
-    <button id="btn_blacklist" class="toolbar-btn" type="button" onclick="toggleBlacklistView()" style="height: 42px; gap: 6px;">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+    <button id="btn_blacklist" class="toolbar-btn" type="button" onclick="toggleBlacklistView()">
+      <svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M18.364 5.636l-12.728 12.728M12 3a9 9 0 110 18 9 9 0 010-18z" />
       </svg>
       拉黑菜单
     </button>
   </section>
+  <dialog id="risk_dialog" class="risk-dialog" aria-labelledby="risk_dialog_title">
+    <form id="risk_form" autocomplete="off">
+      <h2 id="risk_dialog_title">风险检测 API Key</h2>
+      <p class="risk-dialog-description">每个网站最多填写 5 个 Key，同一网站的 Key 会轮流使用。</p>
+      <div id="risk_providers"></div>
+      <p id="risk_dialog_feedback" class="risk-feedback" role="alert"></p>
+      <div class="risk-dialog-actions">
+        <button id="risk_cancel" type="button">取消</button>
+        <button id="risk_save" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
@@ -5156,14 +5212,193 @@ function latencyCell(ms) {
 }
 
 function riskDisplay(n) {
+  if (riskConfig?.status !== "active") return {text: "未检测", cls: "", title: ""};
   const r = n.exit_risk || {};
-  const levels = {low:"低风险", review:"待复核", high:"高风险", unknown:"未验证", off:"已关闭"};
+  const levels = {low:"低风险", review:"待复核", high:"高风险", unknown:"未验证", off:"未检测"};
   const mode = {observe:"观察模式", enforce:"拦截模式", off:"已关闭"}[state.exit_risk_mode];
   const time = r.checked_at ? new Date(r.checked_at * 1000).toLocaleString() : "";
   return {text: (levels[r.level] || "未验证") + (r.score == null ? "" : " " + r.score),
     cls: {low:"latency-good", high:"latency-poor", review:"latency-medium"}[r.level] || "",
     title: [mode, ...(r.reasons || []), (r.sources || []).join(", "), time].filter(Boolean).join(" · ")};
 }
+
+const riskProviderNames = {proxycheck: "ProxyCheck", abuseipdb: "AbuseIPDB", ipqs: "IPQualityScore"};
+const missingRiskKeys = "开启风险检测无效，请至少填写一个 API Key。";
+const riskHints = {
+  checking: "正在验证 API Key…",
+  invalid: "当前所提供的所有 API Key 均无效，风险检测功能未生效。",
+  unavailable: "当前没有可调用的 API Key，风险检测功能未生效。"
+};
+let riskConfig = null, riskDraft = null, riskSaving = false, riskCheckPoll = null;
+
+function canConfigureRiskKeys() {
+  const localHosts = ["localhost", "127.0.0.1", "[::1]"];
+  const securePage = location.protocol === "https:" || localHosts.includes(location.hostname);
+  return riskConfig?.secure_write && securePage && !riskConfig.locked;
+}
+
+function syncRiskControls(snapshot) {
+  if (snapshot && (!riskConfig || snapshot.revision > riskConfig.revision ||
+      (snapshot.revision === riskConfig.revision && snapshot.health_revision >= riskConfig.health_revision))) {
+    riskConfig = snapshot;
+  }
+  if (!riskConfig) return;
+  const canConfigure = canConfigureRiskKeys();
+  const pendingEnable = $("risk_dialog").open && riskDraft?.enabling;
+  $("risk_toggle").checked = riskConfig.enabled || Boolean(pendingEnable);
+  $("risk_toggle").disabled = riskSaving || riskConfig.locked;
+  $("risk_configure").disabled = riskSaving || !canConfigure || !riskConfig.enabled;
+  const hint = $("risk_hint");
+  hint.textContent = riskConfig.locked ? "该功能已停用。" :
+    (riskHints[riskConfig.status] || (canConfigure ? "开启该功能需要提供可调用的API Key" :
+      "配置 API Key 需通过 HTTPS 或 SSH 本地隧道。"));
+  hint.classList.toggle("risk-invalid", ["invalid", "unavailable"].includes(riskConfig.status));
+  $("risk_save").disabled = riskSaving;
+  $("risk_cancel").disabled = riskSaving;
+  if (riskConfig.pending_checks && riskCheckPoll === null) {
+    riskCheckPoll = setTimeout(async () => {
+      riskCheckPoll = null;
+      if (!riskConfig.pending_checks) return;
+      try {
+        const response = await fetch("./api/risk_settings");
+        if (response.ok) {
+          const statusBefore = riskConfig.status;
+          syncRiskControls(await response.json());
+          if (riskConfig.status !== statusBefore) load().catch(() => {});
+        }
+      } catch (_) {
+        // Normal node polling can resume the check after a temporary UI network error.
+      }
+    }, 1000);
+  }
+}
+
+function addRiskKeyRow(fieldset, savedIndex = null) {
+  const rows = fieldset.querySelector(".risk-key-rows");
+  const add = fieldset.querySelector(".risk-key-add");
+  if (rows.childElementCount >= riskConfig.max_keys) return;
+  const row = document.createElement("div");
+  row.className = "risk-key-row";
+  const input = document.createElement("input");
+  input.type = "password";
+  input.maxLength = 128;
+  input.autocomplete = "new-password";
+  input.setAttribute("aria-label", riskProviderNames[fieldset.dataset.provider] + " API Key");
+  input.placeholder = savedIndex === null ? "输入 API Key" : "已保存，留空保留";
+  if (savedIndex !== null) input.dataset.saved = savedIndex;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "移除";
+  remove.addEventListener("click", () => {
+    row.remove();
+    add.disabled = false;
+  });
+  row.append(input, remove);
+  rows.append(row);
+  add.disabled = rows.childElementCount >= riskConfig.max_keys;
+  if ($("risk_dialog").open) input.focus();
+}
+
+function openRiskDialog(enabling) {
+  if (!canConfigureRiskKeys() || riskSaving || (!enabling && !riskConfig.enabled)) return;
+  riskDraft = {enabling, enabled: enabling || riskConfig.enabled, revision: riskConfig.revision};
+  $("risk_feedback").textContent = "";
+  $("risk_dialog_feedback").textContent = "";
+  $("risk_providers").innerHTML = Object.entries(riskProviderNames).map(([name, label]) => `
+    <fieldset class="risk-provider" data-provider="${name}">
+      <legend>${label}</legend>
+      <div class="risk-key-rows"></div>
+      <button type="button" class="risk-key-add">添加 Key</button>
+    </fieldset>`).join("");
+  for (const fieldset of $("risk_providers").querySelectorAll("fieldset")) {
+    const count = riskConfig.key_counts[fieldset.dataset.provider] || 0;
+    fieldset.querySelector(".risk-key-add").onclick = () => addRiskKeyRow(fieldset);
+    for (let index = 0; index < Math.max(1, count); index++) {
+      addRiskKeyRow(fieldset, count ? index : null);
+    }
+  }
+  $("risk_save").textContent = enabling ? "保存并开启" : "保存";
+  $("risk_dialog").showModal();
+  syncRiskControls();
+}
+
+async function saveRiskSettings(payload, feedback, endpoint = "./api/risk_settings") {
+  if (riskSaving) return false;
+  riskSaving = true;
+  feedback.textContent = "";
+  syncRiskControls();
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    syncRiskControls(result.settings);
+    if (!response.ok || !result.ok) {
+      feedback.textContent = result.error || "无法保存风险检测设置。";
+      return false;
+    }
+    return true;
+  } catch (_) {
+    feedback.textContent = "无法保存风险检测设置，请重试。";
+    return false;
+  } finally {
+    riskSaving = false;
+    syncRiskControls();
+  }
+}
+
+$("risk_toggle").addEventListener("change", async event => {
+  const enabled = event.currentTarget.checked;
+  if (enabled && canConfigureRiskKeys()) {
+    openRiskDialog(true);
+    return;
+  }
+  const feedback = $("risk_feedback");
+  if (enabled && !Object.values(riskConfig.key_counts).some(Boolean)) {
+    feedback.textContent = missingRiskKeys;
+    syncRiskControls();
+    return;
+  }
+  if (await saveRiskSettings({enabled, revision: riskConfig.revision}, feedback, "./api/risk_enabled")) {
+    render();
+    load().catch(() => {});
+  }
+});
+$("risk_configure").addEventListener("click", () => openRiskDialog(false));
+$("risk_cancel").addEventListener("click", () => $("risk_dialog").close());
+$("risk_dialog").addEventListener("cancel", event => {
+  if (riskSaving) event.preventDefault();
+});
+$("risk_dialog").addEventListener("close", () => {
+  if (riskDraft?.enabling && !riskConfig.enabled && !Object.values(riskConfig.key_counts).some(Boolean)) {
+    $("risk_feedback").textContent = missingRiskKeys;
+  }
+  riskDraft = null;
+  $("risk_providers").replaceChildren();
+  syncRiskControls();
+});
+$("risk_form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const keys = {};
+  for (const fieldset of $("risk_providers").querySelectorAll("fieldset")) {
+    keys[fieldset.dataset.provider] = Array.from(fieldset.querySelectorAll("input")).flatMap(input => {
+      const text = input.value.trim();
+      if (text) return [text];
+      return input.dataset.saved === undefined ? [] : [Number(input.dataset.saved)];
+    });
+  }
+  const hasKeys = Object.values(keys).some(items => items.length);
+  if (riskDraft.enabling && !hasKeys) {
+    $("risk_dialog_feedback").textContent = missingRiskKeys;
+    return;
+  }
+  if (await saveRiskSettings({enabled: riskDraft.enabled && hasKeys, keys, revision: riskDraft.revision}, $("risk_dialog_feedback"))) {
+    if (riskDraft.enabled && !hasKeys) $("risk_feedback").textContent = missingRiskKeys;
+    $("risk_dialog").close();
+    render();
+    load().catch(() => {});
+  }
+});
 
 function updateCountryFilter() {
   const select = $("country_filter");
@@ -5237,6 +5472,7 @@ function stableSortNodes() {
 }
 
 function render(){
+  syncRiskControls(state.risk_settings);
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n && (n.active || n.id === activeNodeId));
   const tableHead = document.querySelector(".table-container table thead");
@@ -6610,144 +6846,120 @@ def local_proxy_port_connect_error(timeout: float) -> Exception | None:
             except Exception:
                 pass
 
-def check_proxy_health() -> dict[str, Any]:
-    # 1. 检测代理服务端口是否在监听（偶发超时先重试一次，避免误判）
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    connect_error = local_proxy_port_connect_error(1.5)
-    if connect_error is not None:
-        time.sleep(1)
-        connect_error = local_proxy_port_connect_error(3.0)
-    if connect_error is not None:
-        diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
-        diag_msg = f"{diag[1]} 原始错误: {connect_error}" if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {connect_error}"
-        prefix = "本地代理网关连接超时" if diag and diag[0] == 3011 else "代理服务未运行"
-        # local_failure: 故障在本机代理网关而非 VPN 节点，调用方不能据此拉黑节点
-        return {
-            "ok": False,
-            "local_failure": True,
-            "error": f"{prefix} ({diag_msg})"
-        }
+HTTPS_HEALTH_TARGETS = (
+    "https://www.google.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+)
+HTTPS_EGRESS_IP_TARGETS = (
+    ("https://1.1.1.1/cdn-cgi/trace", False),
+    ("https://api.ipify.org", True),
+)
+HTTPS_FAILURE_RECHECK_SECONDS = 5
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
-    if sys.platform.startswith("linux") and not tun_path.exists():
-        return {
-            "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
-        }
 
-    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试出口 IP 与实际延迟
-    def _curl_via_proxy(url: str, max_time: int) -> tuple[int, str, str] | None:
-        """经本地代理请求 url，成功返回 (延迟毫秒, HTTP 状态码, 响应体)。"""
-        proxy_hosts = []
-        if LOCAL_PROXY_HOST == "::":
-            proxy_hosts = ["[::1]", "127.0.0.1"]
-        elif LOCAL_PROXY_HOST == "0.0.0.0":
-            proxy_hosts = ["127.0.0.1"]
-        elif ":" in LOCAL_PROXY_HOST:
-            proxy_hosts = [f"[{LOCAL_PROXY_HOST}]", "127.0.0.1"]
-        else:
-            proxy_hosts = [LOCAL_PROXY_HOST]
-
-        for p_host in proxy_hosts:
-            proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
-            proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
-            cmd = [
-                "curl", "-s",
-                "-w", "\n%{time_total} %{http_code}",
-                "-x", proxy_url,
-                url,
-                "--max-time", str(max_time)
-            ]
-            if proxy_user is not None and proxy_pass is not None:
-                cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 1)
-                if res.returncode == 0:
-                    lines = res.stdout.strip().splitlines()
-                    # 计时固定在最后一行；ip.sb 等响应体自带换行，不能按固定行号取
-                    if lines:
-                        time_info = lines[-1].strip().split()
-                        if len(time_info) == 2:
-                            total_time_str, http_code = time_info
-                            return int(float(total_time_str) * 1000), http_code, "\n".join(lines[:-1])
-            except Exception:
-                pass
-        return None
-
-    try:
-        best_latency: int | None = None
-        egress_ip = ""
-        budget_deadline = time.monotonic() + 12
-        for url, body_is_ip in EGRESS_LATENCY_TARGETS:
-            remaining = budget_deadline - time.monotonic()
-            if remaining < 1:
-                break
-            fetched = _curl_via_proxy(url, max(1, min(5, int(remaining))))
-            if not fetched:
-                continue
-            latency_ms, http_code, body = fetched
-            if http_code not in ("200", "204"):
-                continue
-            if best_latency is None or latency_ms < best_latency:
-                best_latency = latency_ms
-            if not egress_ip:
-                egress_ip = parse_egress_ip_from_body(body, body_is_ip)
-        if best_latency is not None and egress_ip:
-            return {"ok": True, "ip": egress_ip, "latency_ms": max(1, best_latency)}
-            
-        # 此时外网测试失败，检测本地代理端口是否依然能连通。若仍能连通，直接抛出出口测试失败，不调用占用诊断
-        port_still_listening = False
-        test_sock = None
+def probe_proxy_https(url: str, timeout: float) -> tuple[int, str, int, str]:
+    host = LOCAL_PROXY_HOST
+    if host == "::":
+        proxy_hosts = ("[::1]", "127.0.0.1")
+    elif host in ("", "0.0.0.0"):
+        proxy_hosts = ("127.0.0.1",)
+    else:
+        proxy_hosts = (f"[{host}]" if ":" in host else host,)
+    username, password = proxy_server.get_proxy_credentials()
+    deadline = time.monotonic() + timeout
+    for proxy_host in proxy_hosts:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 28, "000", 0, ""
+        cmd = ["curl", "-q", "--silent", "--noproxy", "", "--proto", "=https",
+               "--socks5-hostname", f"{proxy_host}:{LOCAL_PROXY_PORT}", "--max-time", f"{remaining:.3f}",
+               "--max-filesize", "4096", "--write-out", "\n%{time_total} %{http_code}"]
+        if username is not None and password is not None:
+            cmd.extend(["--proxy-user", f"{username}:{password}"])
         try:
-            test_sock = socket.socket(af, socket.SOCK_STREAM)
-            test_sock.settimeout(1.0)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                test_sock.connect((connect_host, LOCAL_PROXY_PORT))
-                port_still_listening = True
-            except Exception:
-                if connect_host == "::1":
-                    test_sock.close()
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_sock.settimeout(1.0)
-                    test_sock.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                    port_still_listening = True
-        except Exception:
-            pass
-        finally:
-            if test_sock is not None:
-                try:
-                    test_sock.close()
-                except Exception:
-                    pass
+            result = subprocess.run([*cmd, url], capture_output=True, encoding="utf-8", errors="replace",
+                                    timeout=remaining + 0.5)
+        except subprocess.TimeoutExpired:
+            return 28, "000", 0, ""
+        except OSError:
+            return -1, "000", 0, ""
+        # An IPv6 listener can be absent. A destination failure from SOCKS is not a listener failure.
+        if result.returncode == 7 and proxy_host == "[::1]":
+            continue
+        body, _, timing = result.stdout.rstrip().rpartition("\n")
+        try:
+            seconds, status = timing.split()
+            return result.returncode, status, max(1, int(float(seconds) * 1000)), body
+        except (ValueError, OverflowError):
+            return result.returncode or -1, "000", 0, ""
+    return 7, "000", 0, ""
 
-        if not port_still_listening:
+
+def check_proxy_health(*, require_egress_ip: bool = False) -> dict[str, Any]:
+    node_id, process = active_openvpn_node_id, active_openvpn_process
+    port_error = local_proxy_port_connect_error(1.5)
+    if port_error is not None:
+        time.sleep(1)
+        port_error = local_proxy_port_connect_error(3.0)
+        if port_error is not None:
             diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
-            if diag:
-                return {"ok": False, "local_failure": True, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
-            
-        return {"ok": False, "error": "出口连接测试失败 (ip.sb 和 api.ipify.org 均无法连通，可能是节点已失效或 VPS 防火墙限制了 UDP/TCP 出站端口)"}
-    except Exception as e:
-        return {"ok": False, "error": f"出口连接测试异常: {e}"}
+            reason = diag[1] if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败"
+            return {"ok": False, "local_failure": True, "error": f"本地代理网关不可用 ({reason})"}
+    if sys.platform.startswith("linux") and not Path("/sys/class/net/tun0").exists():
+        return {"ok": False, "error": "[ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 tun0 未启用"}
+
+    latencies, attempts = [], []
+    for url in HTTPS_HEALTH_TARGETS:
+        rc, status, latency, _ = probe_proxy_https(url, 3)
+        if rc == 0 and status == "204":
+            latencies.append(latency)
+        attempts.append(f"{urllib.parse.urlsplit(url).hostname} rc={rc} http={status} ms={latency}")
+    if not latencies:
+        if local_proxy_port_connect_error(1) is not None:
+            return {"ok": False, "local_failure": True, "error": "HTTPS 探测期间本地代理网关不可用"}
+        return {"ok": False, "https_failure": True, "error": "[EgressHTTPS] 两个目标均失败: " + "; ".join(attempts)}
+
+    egress_ip = ""
+    for url, body_is_ip in HTTPS_EGRESS_IP_TARGETS:
+        rc, status, _, body = probe_proxy_https(url, 2)
+        if rc == 0 and status == "200":
+            egress_ip = exit_risk.public_ip(parse_egress_ip_from_body(body, body_is_ip))
+            if egress_ip:
+                break
+    if not egress_ip:
+        if require_egress_ip:
+            return {"ok": False, "error": "HTTPS 已连通，但无法验证新隧道的实际出口 IP"}
+        state = read_json(STATE_FILE, {})
+        if node_id and node_id == active_openvpn_node_id == state.get("active_openvpn_node_id") and process is active_openvpn_process:
+            egress_ip = exit_risk.public_ip(state.get("proxy_ip"))
+    return {"ok": True, "ip": egress_ip, "latency_ms": min(latencies)}
+
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
+    failed_tunnel = None
     time.sleep(30)
     while True:
         last_checker_heartbeat = time.time()
         try:
             if is_connecting:
+                failed_tunnel = None
                 time.sleep(5)
                 continue
             if enforce_active_not_manual_blacklisted():
+                failed_tunnel = None
                 time.sleep(5)
                 continue
 
+            tunnel = (active_openvpn_node_id, active_openvpn_process)
             res = check_proxy_health()
+            if is_connecting or tunnel != (active_openvpn_node_id, active_openvpn_process):
+                failed_tunnel = None
+                time.sleep(5)
+                continue
+            needs_confirmation = bool(res.get("https_failure") and tunnel[0] and active_openvpn_running())
+            confirm_again = needs_confirmation and failed_tunnel != tunnel
+            failed_tunnel = tunnel if confirm_again else None
             if res["ok"]:
                 set_state(
                     proxy_ok=True,
@@ -6770,6 +6982,11 @@ def background_proxy_checker() -> None:
                     proxy_latency_ms=0,
                     proxy_error=error_msg
                 )
+
+                if confirm_again:
+                    log_to_json("WARNING", "Proxy", "HTTPS 探测首次失败，5 秒后复核当前隧道")
+                    time.sleep(HTTPS_FAILURE_RECHECK_SECONDS)
+                    continue
 
                 if res.get("local_failure") and active_openvpn_running():
                     # 本机代理网关的问题（如瞬时繁忙）与节点无关：不拉黑、不切换，下个周期重新检测
@@ -6819,100 +7036,6 @@ def active_node_pinger() -> None:
         except Exception as e:
             print(f"[ERROR] active_node_pinger error: {e}", flush=True)
         time.sleep(10)
-
-def fixed_region_latency_guard() -> None:
-    time.sleep(60)
-    while True:
-        try:
-            ui_cfg = wait_latency_check_interval()
-            if ui_cfg.get("routing_mode") != "fixed_region":
-                continue
-            if not ui_cfg.get("connection_enabled", True):
-                continue
-            if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
-                continue
-            if enforce_active_not_manual_blacklisted():
-                continue
-
-            result = check_proxy_health()
-            if not result.get("ok"):
-                continue
-            latency = parse_int(result.get("latency_ms"))
-            latency_threshold = get_latency_threshold_ms(ui_cfg)
-            set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
-            if latency <= latency_threshold:
-                continue
-
-            interval_minutes = get_latency_check_interval_minutes(ui_cfg)
-            reason = f"固定地区 {interval_minutes} 分钟巡检发现当前节点真实出口延迟 {latency} ms > {latency_threshold} ms"
-            print(f"[固定地区延迟巡检] {reason}", flush=True)
-            log_to_json("WARNING", "VPN", reason)
-            with lock:
-                nodes = read_nodes()
-                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                if active_node:
-                    mark_blacklisted(active_node, reason)
-                    active_node["probe_status"] = "unavailable"
-                    active_node["probe_message"] = reason
-                    active_node["latency_ms"] = latency
-                    write_json(NODES_FILE, sort_all_nodes(nodes))
-                    cleanup_favorite_node_ids(nodes)
-
-            before_id = active_openvpn_node_id
-            refresh_and_switch_fixed_region(reason)
-            after_id = active_openvpn_node_id
-            if before_id and after_id == before_id:
-                log_node_activity("STALL", f"Latency exceeded threshold but fixed_region did not switch; reason={reason}", active_node)
-        except Exception as exc:
-            print(f"[固定地区延迟巡检] 执行异常: {exc}", flush=True)
-            log_to_json("ERROR", "VPN", f"固定地区延迟巡检异常: {exc}")
-
-def fixed_favorites_latency_guard() -> None:
-    time.sleep(60)
-    while True:
-        try:
-            ui_cfg = wait_latency_check_interval()
-            if ui_cfg.get("routing_mode") != "fixed_favorites":
-                continue
-            if not ui_cfg.get("connection_enabled", True):
-                continue
-            if is_connecting or not active_openvpn_node_id or not active_openvpn_running():
-                continue
-            if enforce_active_not_manual_blacklisted():
-                continue
-
-            result = check_proxy_health()
-            if not result.get("ok"):
-                continue
-            latency = parse_int(result.get("latency_ms"))
-            latency_threshold = get_latency_threshold_ms(ui_cfg)
-            set_state(proxy_ok=True, proxy_ip=result.get("ip", ""), proxy_latency_ms=latency, proxy_error="")
-            if latency <= latency_threshold:
-                continue
-
-            interval_minutes = get_latency_check_interval_minutes(ui_cfg)
-            reason = f"固定收藏菜单 {interval_minutes} 分钟巡检发现当前节点真实出口延迟 {latency} ms > {latency_threshold} ms"
-            print(f"[固定收藏延迟巡检] {reason}", flush=True)
-            log_to_json("WARNING", "VPN", reason)
-            with lock:
-                nodes = read_nodes()
-                active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                if active_node:
-                    mark_blacklisted(active_node, reason)
-                    active_node["probe_status"] = "unavailable"
-                    active_node["probe_message"] = reason
-                    active_node["latency_ms"] = latency
-                    write_json(NODES_FILE, sort_all_nodes(nodes))
-                    cleanup_favorite_node_ids(nodes)
-
-            before_id = active_openvpn_node_id
-            refresh_and_switch_fixed_favorites(reason)
-            after_id = active_openvpn_node_id
-            if before_id and after_id == before_id:
-                log_node_activity("STALL", f"Latency exceeded threshold but fixed_favorites did not switch; reason={reason}", active_node)
-        except Exception as exc:
-            print(f"[固定收藏延迟巡检] 执行异常: {exc}", flush=True)
-            log_to_json("ERROR", "VPN", f"固定收藏延迟巡检异常: {exc}")
 
 def active_latency_refresh_guard() -> None:
     time.sleep(60)
@@ -7001,6 +7124,33 @@ def node_activity_logger_loop() -> None:
         time.sleep(10)
 
 class Handler(BaseHTTPRequestHandler):
+    def secure_risk_settings_transport(self) -> bool:
+        try:
+            peer = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+        if str(peer) in UI_HTTPS_PROXIES and self.headers.get_all("X-Forwarded-Proto") == ["https"]:
+            return True
+        host = self.headers.get("Host", "").lower()
+        origin = self.headers.get("Origin")
+        forwarded = any(name in self.headers for name in (
+            "Forwarded", "Via", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
+        ))
+        return bool(peer.is_loopback and not forwarded
+                    and re.fullmatch(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?", host)
+                    and (origin is None or origin == "http://" + host))
+
+    def risk_settings_view(self):
+        return {**risk_settings_summary(), "secure_write": self.secure_risk_settings_transport()}
+
+    def same_origin_risk_toggle(self) -> bool:
+        hosts = self.headers.get_all("Host") or []
+        return (len(hosts) == 1 and bool(hosts[0])
+                and self.headers.get_all("Origin") == ["http://" + hosts[0].lower()]
+                and self.headers.get_all("Sec-Fetch-Site") in (None, ["same-origin"]))
+
     def get_secret_path(self) -> str:
         ui_cfg = load_ui_config()
         return ui_cfg.get("secret_path", "EJsW2EeBo9lY")
@@ -7093,6 +7243,8 @@ class Handler(BaseHTTPRequestHandler):
                 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.replace("__APP_VERSION__", APP_VERSION + ("（稳定版）" if APP_CHANNEL == "stable" else "（发行版）")).encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/api/risk_settings":
+            self.send_json(self.risk_settings_view())
         elif effective_path == "/api/nodes":
             global last_active_latency, active_openvpn_node_id
             trigger_login_refresh_if_needed()
@@ -7108,17 +7260,20 @@ class Handler(BaseHTTPRequestHandler):
                 shown_latency = live_latency or last_active_latency
                 if shown_latency > 0:
                     active_node["latency_ms"] = shown_latency
+            settings = self.risk_settings_view()
+            mode = RISK_MODE if settings["status"] == "active" else "off"
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()
                 for old_field in [k for k in stripped if k.startswith("purity_")]:
                     stripped.pop(old_field)
-                stripped["exit_risk"] = (node_risk(n) if RISK_MODE != "off"
+                stripped["exit_risk"] = (node_risk(n) if mode != "off"
                                          else {"level": "off", "score": None})
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": {**get_state(), "exit_risk_mode": RISK_MODE}})
+            self.send_json({"nodes": stripped_nodes, "state": {**get_state(), "exit_risk_mode": mode,
+                                                               "risk_settings": settings}})
         elif effective_path == "/api/version_check":
             self.send_json(check_version_notice())
         elif effective_path == "/api/manual_blacklist":
@@ -7324,6 +7479,42 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path in ("/api/risk_settings", "/api/risk_enabled"):
+            toggle_only = effective_path == "/api/risk_enabled"
+            if not self.secure_risk_settings_transport():
+                if not toggle_only:
+                    self.send_json({"ok": False, "error": "请通过 HTTPS 或 SSH 本地隧道配置 API Key。"}, HTTPStatus.FORBIDDEN)
+                    return
+                if not self.same_origin_risk_toggle():
+                    self.send_json({"ok": False, "error": "请从当前管理页面切换风险检测。"}, HTTPStatus.FORBIDDEN)
+                    return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                self.send_json({"ok": False, "error": "请求必须使用 JSON。"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            try:
+                payload = self.read_json_body(max_bytes=8192)
+                if toggle_only and set(payload) != {"enabled", "revision"}:
+                    raise exit_risk.RiskSettingsError("开关请求只接受启用状态和版本号。")
+                if RISK_MODE == "off":
+                    raise exit_risk.RiskSettingsError("该功能已停用。")
+                risk_settings.update(payload.get("enabled"), payload.get("keys", {}), payload.get("revision"))
+            except exit_risk.StaleRiskSettings as exc:
+                self.send_json({"ok": False, "error": str(exc), "settings": self.risk_settings_view()}, HTTPStatus.CONFLICT)
+                return
+            except exit_risk.RiskSettingsError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except ValueError:
+                self.send_json({"ok": False, "error": "风险检测设置格式无效。"}, HTTPStatus.BAD_REQUEST)
+                return
+            except OSError:
+                self.send_json({"ok": False, "error": "无法保存风险检测设置。"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            if RISK_MODE != "off" and risk_settings.enabled:
+                risk_refresh_requested.set()
+            self.send_json({"ok": True, "settings": self.risk_settings_view()})
             return
 
         if effective_path == "/api/update_credentials":
@@ -7721,7 +7912,7 @@ class Tee:
         return getattr(self.stdout, attr)
 
 def main() -> None:
-    if RISK_MODE == "enforce":
+    if risk_gate_enabled():
         proxy_server.admit_tunnel(())
     ensure_dirs()
     install_crash_log_hooks()
@@ -7741,6 +7932,8 @@ def main() -> None:
     tee = Tee(str(log_file), LOG_FILE_MAX_BYTES)
     sys.stdout = tee
     sys.stderr = tee
+    print(f"[RiskHealth] event=start policy={RISK_MODE} status={risk_settings_summary()['status']} "
+          f"cached_gate={int(risk_gate_enabled())}", flush=True)
 
     write_json(
         STATE_FILE,

@@ -59,8 +59,7 @@ AimiliVPN_Analysis_ZH.md
 scratch/
 *连接配置*
 test_*.py
-!tests/test_gateway_ipv6_tls.py
-!tests/test_conntrack_tuning.py
+!/tests/test_*.py
 *.bak
 *.orig
 
@@ -68,14 +67,3 @@ test_*.py
 .DS_Store
 Thumbs.db
 Desktop.ini
-
-!tests/test_update_channel.py
-
-!tests/test_openvpn_recovery.py
-
-!tests/test_crl_cache.py
-!tests/test_openrc_supervision.py
-!tests/test_startup_listeners.py
-!tests/test_ip_info_queries.py
-!tests/test_ml_config_safety.py
-!tests/test_exit_risk.py
