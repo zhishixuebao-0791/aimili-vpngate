@@ -1,4 +1,12 @@
-# 可选服务器运维工具
+# 服务器运维工具
+
+## 独立出网监控
+
+一键部署会在 systemd 或 OpenRC 注册并启动 `aimili-monitor`。它每分钟通过本机 SOCKS 代理探测两个 HTTPS 目标，任一成功即记录可用。首次失败保留现场快照，连续两轮失败和恢复时各记录一次状态变化。日志和快照保存在仅 root 可读的 `/var/log/aimili-monitor/`。
+
+安装时设定 `AIMILI_MONITOR=0` 可跳过安装。已有自管的同名服务会被保留。`ml` 卸载时会停止并移除一键部署安装的服务，保留日志。
+
+## OpenVPN CRL 缓存
 
 `crl_cache.py` 是 2026-11-10 生产服务器的独立 OpenVPN CRL 缓存工具源码备份，未接入通用安装器，不会因仓库常规更新自动启用。依赖 Linux/systemd cgroup v2、Python 3.10+、OpenVPN 2.5+ 和 OpenSSL 3.0+。
 

@@ -253,7 +253,8 @@ class InstallerLifecycleTests(unittest.TestCase):
     def test_uninstall_rolls_back_before_stopping_or_removing_application(self):
         events, namespace = self.uninstall(0)
         self.assertEqual(events[0], ('command', ['python3', '/test/install/conntrack_tuning.py', 'rollback']))
-        self.assertEqual(events[1], ('stop',))
+        self.assertEqual(events[1], ('command', ['sh', '/test/install/ops/install_monitor.sh', 'uninstall']))
+        self.assertEqual(events[2], ('stop',))
         self.assertIn(('command', ['rm', '-rf', '/test/install']), events)
 
     def test_failed_rollback_preserves_application_and_rollback_tool(self):

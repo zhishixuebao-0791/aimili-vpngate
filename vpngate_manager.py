@@ -107,11 +107,10 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 # 发行版本号。发布新版本时同步修改此处并打同名 git 标签 v<版本号>
-APP_VERSION = "1.26.24"
+APP_VERSION = "1.26.26"
 APP_CHANNEL = "release"
 # 版本标签格式 vX.Y.Z（主版本最多 3 位，自动排除 V2026.06.16 这类旧日期标签）；
 # 应用内新版本提示只读取release_channels.json中本渠道的版本
-STABLE_TAG_RE = re.compile(r"v(\d{1,3})\.(\d+)\.(\d+)")
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
@@ -196,11 +195,6 @@ def ensure_dirs() -> None:
         except OSError:
             pass
 
-def mark_login_refresh_required(reason: str = "manual marker") -> None:
-    ensure_dirs()
-    payload = {"reason": reason, "created_at": time.time()}
-    write_json(LOGIN_REFRESH_REQUIRED_FILE, payload)
-
 def consume_login_refresh_required() -> dict[str, Any] | None:
     if not LOGIN_REFRESH_REQUIRED_FILE.exists():
         return None
@@ -247,12 +241,6 @@ def github_api_get(path: str, timeout: int = 3) -> Any:
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
-
-def stable_version_key(tag: str) -> tuple[int, int, int] | None:
-    match = STABLE_TAG_RE.fullmatch(str(tag or "").strip())
-    if not match:
-        return None
-    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 def latest_github_version_ref() -> tuple[str, str, str]:
     """Only advertise the version pinned for this installation's own channel."""
@@ -404,16 +392,6 @@ def normalize_ip_value(value: Any) -> str:
 
 def node_ip_value(node: dict[str, Any]) -> str:
     return normalize_ip_value(node.get("ip")) or normalize_ip_value(node.get("remote_host"))
-
-def node_ip_values(node: dict[str, Any] | None) -> set[str]:
-    if not isinstance(node, dict):
-        return set()
-    values: set[str] = set()
-    for key in ("ip", "remote_host", "egress_ip", "proxy_ip", "blacklisted_ip"):
-        ip = normalize_ip_value(node.get(key))
-        if ip:
-            values.add(ip)
-    return values
 
 def node_egress_ip_values(node: dict[str, Any] | None) -> set[str]:
     if not isinstance(node, dict):
@@ -643,7 +621,6 @@ def disconnect_active_if_manual_blacklisted(ip: str) -> bool:
         return bool(old_active_id)
     return False
 
-import hashlib
 import random
 
 def generate_random_password() -> str:
@@ -829,10 +806,6 @@ try:
         UI_HOST = _init_cfg["host"]
 except Exception:
     pass
-
-def get_session_token(password: str, username: str = "admin") -> str:
-    salt = "aimilivpn_secure_salt_2026"
-    return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 _last_cleanup_time = 0.0
 
@@ -2048,26 +2021,6 @@ def remove_nodes_by_ids(node_ids: set[str]) -> None:
         kept = [n for n in nodes if not (isinstance(n, dict) and str(n.get("id") or "") in node_ids)]
         if len(kept) != len(nodes):
             write_json(NODES_FILE, sort_all_nodes(kept))
-
-def remove_nodes_by_ips(ips: set[str]) -> list[str]:
-    normalized = {normalize_ip_value(ip) for ip in ips}
-    normalized.discard("")
-    if not normalized:
-        return []
-    removed: list[str] = []
-    with lock:
-        nodes = read_json(NODES_FILE, [])
-        if not isinstance(nodes, list):
-            return []
-        kept = []
-        for node in nodes:
-            if isinstance(node, dict) and node_egress_ip_values(node).intersection(normalized):
-                removed.append(str(node.get("id") or ""))
-                continue
-            kept.append(node)
-        if removed:
-            write_json(NODES_FILE, sort_all_nodes(kept))
-    return removed
 
 def mark_node_connect_failed(node_id: str, message: str) -> None:
     node_id = str(node_id or "")
@@ -4021,13 +3974,23 @@ INDEX_HTML = r"""<!doctype html>
       padding: 16px;
       margin-bottom: 24px;
       display: flex;
-      gap: 16px;
+      gap: 12px;
       flex-wrap: wrap;
       align-items: center;
     }
 
-    .toolbar select {
-      width: 180px;
+    .toolbar-filters {
+      flex: 1 1 360px;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 180px));
+      gap: 12px;
+    }
+
+    .toolbar-filters select {
+      width: 100%;
+      min-width: 0;
+      color-scheme: dark;
       height: 42px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid var(--border-color);
@@ -4036,36 +3999,51 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-primary);
       font-family: inherit;
       font-size: 14px;
-      outline: none;
-      transition: all 0.2s ease;
+      transition: border-color 0.2s ease, background-color 0.2s ease;
       cursor: pointer;
     }
 
-    .toolbar select:focus {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: #0f172a;
-    }
-
-    .toolbar input {
-      flex: 1;
-      min-width: 250px;
+    .toolbar > .toolbar-btn {
       height: 42px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 16px;
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 14px;
-      transition: all 0.2s ease;
     }
 
-    .toolbar input:focus {
-      outline: none;
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.8);
+    .toolbar > .toolbar-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .toolbar :is(select, button, input):focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+
+    @media (max-width: 960px) {
+      .toolbar-filters {
+        flex-basis: 100%;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .toolbar > .toolbar-btn {
+        flex: 1;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .toolbar, .toolbar-filters {
+        gap: 10px;
+      }
+
+      .toolbar {
+        padding: 12px;
+      }
+
+      .toolbar-filters {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      #ip_type_filter {
+        grid-column: 1 / -1;
+      }
     }
 
     .table-wrapper {
@@ -4291,21 +4269,18 @@ INDEX_HTML = r"""<!doctype html>
         flex-direction: column;
         align-items: flex-start;
         padding: 16px 20px;
+        gap: 12px;
       }
       .btn-group {
         width: 100%;
-        margin-top: 12px;
+        flex-wrap: wrap;
+        gap: 8px;
       }
-      .btn-group button, .btn-group .btn-telegram {
-        flex: 1;
+      .btn-group > * {
+        flex: 1 1 120px;
       }
-      .btn-group .dropdown {
-        flex: 1;
-        display: flex;
-      }
-      .btn-group .dropdown button {
+      .btn-group .dropdown > button {
         width: 100%;
-        flex: 1;
       }
       main {
         padding: 16px 20px;
@@ -4555,27 +4530,29 @@ INDEX_HTML = r"""<!doctype html>
 
 
   <section class="toolbar">
-    <select id="status_filter">
-      <option value="all">全部节点</option>
-      <option value="available">可用节点</option>
-      <option value="unavailable">失效节点</option>
-    </select>
-    <select id="country_filter">
-      <option value="">所有国家</option>
-    </select>
-    <select id="ip_type_filter">
-      <option value="">所有IP类型</option>
-      <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
-    </select>
-    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+    <div class="toolbar-filters">
+      <select id="status_filter" aria-label="节点状态">
+        <option value="all">全部节点</option>
+        <option value="available">可用节点</option>
+        <option value="unavailable">失效节点</option>
+      </select>
+      <select id="country_filter" aria-label="国家或地区">
+        <option value="">所有国家</option>
+      </select>
+      <select id="ip_type_filter" aria-label="IP 类型">
+        <option value="">所有IP类型</option>
+        <option value="residential">住宅IP</option>
+        <option value="hosting">机房IP</option>
+      </select>
+    </div>
+    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()">
+      <svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
       </svg>
       收藏菜单
     </button>
-    <button id="btn_blacklist" class="toolbar-btn" type="button" onclick="toggleBlacklistView()" style="height: 42px; gap: 6px;">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+    <button id="btn_blacklist" class="toolbar-btn" type="button" onclick="toggleBlacklistView()">
+      <svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M18.364 5.636l-12.728 12.728M12 3a9 9 0 110 18 9 9 0 010-18z" />
       </svg>
       拉黑菜单
@@ -6540,8 +6517,6 @@ def local_proxy_port_connect_error(timeout: float) -> Exception | None:
 
 def check_proxy_health() -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听（偶发超时先重试一次，避免误判）
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     connect_error = local_proxy_port_connect_error(1.5)
     if connect_error is not None:
         time.sleep(1)
@@ -6625,35 +6600,8 @@ def check_proxy_health() -> dict[str, Any]:
         if best_latency is not None and egress_ip:
             return {"ok": True, "ip": egress_ip, "latency_ms": max(1, best_latency)}
             
-        # 此时外网测试失败，检测本地代理端口是否依然能连通。若仍能连通，直接抛出出口测试失败，不调用占用诊断
-        port_still_listening = False
-        test_sock = None
-        try:
-            test_sock = socket.socket(af, socket.SOCK_STREAM)
-            test_sock.settimeout(1.0)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                test_sock.connect((connect_host, LOCAL_PROXY_PORT))
-                port_still_listening = True
-            except Exception:
-                if connect_host == "::1":
-                    test_sock.close()
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_sock.settimeout(1.0)
-                    test_sock.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                    port_still_listening = True
-        except Exception:
-            pass
-        finally:
-            if test_sock is not None:
-                try:
-                    test_sock.close()
-                except Exception:
-                    pass
-
-        if not port_still_listening:
+        # 外网探测失败后重新检查本地监听，避免将本机故障归因到节点。
+        if local_proxy_port_connect_error(1.0) is not None:
             diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
             if diag:
                 return {"ok": False, "local_failure": True, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}

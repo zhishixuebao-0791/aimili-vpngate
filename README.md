@@ -1,6 +1,6 @@
 # AimiliVPN 节点管理系统
 
-Bilingual: [中文](#中文) | [English](#english)
+[中文](#中文) · [English](#english) · [一键部署](#一键部署) · [路由模式](#路由模式说明) · [运维工具](ops/README.md) · [更新记录](CHANGELOG.md)
 
 ---
 
@@ -22,48 +22,24 @@ Bilingual: [中文](#中文) | [English](#english)
 
 | 渠道 | 当前版本 | 获取方式 | 说明 |
 | --- | --- | --- | --- |
-| 稳定版 | **v1.26.23** | 对应的一键部署命令、同渠道 `ml update` | 稳定分支维护 |
-| 发行版 | **v1.26.24** | 对应的一键部署命令、同渠道 `ml update` | 发行分支维护 |
+| 稳定版 | **v1.26.25** | 对应的一键部署命令、同渠道 `ml update` | 稳定分支维护 |
+| 发行版 | **v1.26.26** | 对应的一键部署命令、同渠道 `ml update` | 发行分支维护 |
 
 Web 管理界面左上角和 `ml` 管理菜单标题会显示当前运行的版本号。
 
-### 更新日志
-
-- **v1.26.24**（发行版）保留没有延迟结果的失败节点供重试。**v1.26.23**（稳定版）新增真实出口评分和高风险自动切换拦截，并清理普通失败节点。
-- **v1.26.22** / **v1.26.21**（稳定版）：IP信息查询共享限流、并发去重和批量补全；限流时保留信息、不改变测速结论，稳定版补齐ml配置保护，两渠道保存失败不误报成功。
-- **v1.26.20** / **v1.26.19**（稳定版）：修复OpenRC配置变更后自动拉起，以及启动时忽略已保存代理端口的问题；已在真实Alpine/OpenRC客体完成服务行为验证。
-- **v1.26.18** / **v1.26.17**（稳定版）：修正OpenVPN不可达分类，明确TCP启动失败后跳过无效重试等待；增加可选CRL缓存工具源码，默认不自动启用。
-- **v1.26.16** / **v1.26.15**（稳定版）：锁定原安装渠道；兼容旧ml升级、detached HEAD、安装重跑与Web提示。
-- **v1.26.14** / **v1.26.9**（稳定版）：IPv6出口能力匹配、OpenVPN服务端证书用途校验，以及conntrack安装调优、持久化和回退。详见 [更新记录](CHANGELOG.md)。
-- **v1.26.13** / **v1.26.8**（稳定版）：连接前后延迟口径统一
-  - 修复连接后延迟检测解析错误：ip.sb 响应体自带换行导致计时解析失败、每次都退回到响应很慢的 api.ipify.org，延迟被虚高约 200ms，并可能误触发延迟巡检切换节点。
-  - 连接后延迟改为与节点测速使用同一组目标、同样取最快一次（经本地代理测），连接前后的数值可以直接比较。
-  - 节点表格中已连接节点显示真实出口延迟，不再显示 ping VPN 服务器本身的结果；连接时不再额外 ping 服务器，连接更快。
-- **v1.26.12** / **v1.26.7**（稳定版）：线上日志排查修复
-  - 修复固定地区等模式下当前范围没有可用节点时卡死在无连接状态：没有活动连接时从 5 分钟（`NO_NODE_REFETCH_SECONDS`）起按 2 倍退避（封顶 21 分钟）重新从 VPNGate 拉取节点；连接中途断开并持续空闲约 1 分钟后进入兜底流程。
-  - 修复本机代理端口被本服务自己监听时误报"端口被其他进程占用"（ERR_PORT_IN_USE），本机代理网关故障不再拉黑正常节点、不再触发切换；本地端口偶发超时先重试一次，并在提示中保留原始错误。
-  - 代理失败日志按同类错误限流（每类 60 秒打印 1 条，附省略条数）；`vpngate.log` 超过 20MB（`LOG_FILE_MAX_BYTES`）自动轮转为 `vpngate.log.1`，`ml` 查看日志改为 `tail -F` 以跟随轮转。
-- **v1.26.11**
-  - 不可达、拒绝连接或认证失败且延迟显示 `-` 的节点保留在列表，继续进入阶梯冷却（30 分钟 / 2 小时 / 6 小时 / 24 小时）并等待重试。超时显示 `-1`，沿用连续失败或下线后的清理规则。列表仍有容量上限。
-  - 节点数超过上限时优先丢弃不可用节点，保证新节点能进入列表。
-  - 已下线的拉黑节点从列表移除（拉黑 IP 清单本身不受影响）。
-  - 切换到固定 IP 模式时锁定当前连接的节点。
-  - 后台配置改为原子写入；配置文件读取异常时不再重置账号密码。
-  - 连接过程不再覆盖期间其他操作对节点的修改。
-- **v1.26.10**：修复固定 IP 模式重启后无法连接、断开连接误杀测速进程、“更新节点”断开健康节点等问题；新增版本号显示与稳定版/发行版双渠道。
-- **v1.26.6**：稳定版（0629_bug修复 + 版本号显示）。
+稳定版清理普通失败节点，并在风险检测启用时阻止已确认的高风险节点被自动切入。发行版保留没有延迟结果的失败节点，便于重试。完整版本历史见[更新记录](CHANGELOG.md)。
 
 ## 一键部署
 
 在全新的 Linux VPS 上以 `root` 用户执行下面任意一条命令，选择需要的渠道。安装后，`ml update` 只更新该渠道；已有安装不能通过另一条命令串渠道重装。
 
-### 稳定版（v1.26.23）
+### 稳定版（v1.26.25）
 
 ```bash
 AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-### 发行版（v1.26.24）
+### 发行版（v1.26.26）
 
 ```bash
 AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
@@ -136,7 +112,7 @@ ml restart   # 重启服务
 - 首次安装由用户在上方两条一键部署命令中选择渠道。稳定版只更新到新的稳定版，发行版只更新到新的发行版；重装也保持原渠道。
 - 本机渠道记录位于 `vpngate_data/update_channel.json`，代码同时带有 `APP_CHANNEL`。远端 `release_channels.json` 为两渠道分别指定版本，不以全局最大版本号判断渠道。
 - 旧ml可能先把源码重置到main；新安装脚本通过ORIG_HEAD/reflog识别更新前的渠道，在生成服务/启动程序前恢复到本渠道目标。若记录不明、清单缺失或目标渠道不符，会停止，能确认旧提交时会恢复旧源码，不静默转到main。
-- 当前稳定版为v1.26.23，发行版为v1.26.24；已发布旧标签保持不变。渠道由元数据确定，与版本号数字大小无关。
+- 当前稳定版为v1.26.25，发行版为v1.26.26；已发布旧标签保持不变。渠道由元数据确定，与版本号数字大小无关。
 - 本地开发标记`.local_dev`会暂停自动更新/重装，保护当前代码；不会成为绕过渠道校验的入口。
 - 未修改已发布旧标签；旧版本未知来源且缺少可识别版本或Git更新记录时，不能保证自动识别，会明确停止。
 
@@ -192,7 +168,7 @@ ml update
 如需重新安装本渠道的指定新版本，可设置环境变量后运行安装脚本；已有安装不能借此跨渠道（下例适用于稳定版）:
 
 ```bash
-AIMILI_DEPLOY_REF=v1.26.23 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
+AIMILI_DEPLOY_REF=v1.26.25 bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
 ### 发布新版本（维护者）
@@ -237,19 +213,19 @@ This repository is a modified version of AimiliVPN / aimili-vpngate.
 
 Choose one command and run it as `root` on a fresh Linux VPS. Later updates stay on the selected channel.
 
-### Stable (v1.26.23)
+### Stable (v1.26.25)
 
 ```bash
 AIMILI_CHANNEL=stable bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-### Release (v1.26.24)
+### Release (v1.26.26)
 
 ```bash
 AIMILI_CHANNEL=release bash <(curl -fsSL https://raw.githubusercontent.com/zhishixuebao-0791/aimili-vpngate/main/install.sh) zhishixuebao-0791 aimili-vpngate
 ```
 
-Choose **stable v1.26.23** or **release v1.26.24** using the commands above. `ml update` stays on that installation's original channel and never selects the globally largest tag. Re-running the matching install command keeps the channel; the other command is rejected for existing installations. The Web UI shows the running version and channel.
+Choose **stable v1.26.25** or **release v1.26.26** using the commands above. `ml update` stays on that installation's original channel and never selects the globally largest tag. Re-running the matching install command keeps the channel; the other command is rejected for existing installations. The Web UI shows the running version and channel.
 
 After installation, open the printed Web UI URL. You can run `ml` on the server to open the CLI management menu.
 
